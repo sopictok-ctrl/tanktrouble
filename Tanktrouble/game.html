@@ -1,0 +1,1331 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>Tank Trouble LAN</title><style>
+html,body{margin:0;height:100%;background:#111;color:#eee;font-family:Arial,sans-serif;overflow:hidden}
+#wrap{display:flex;flex-direction:column;align-items:center;height:100%}
+#top{height:58px;display:flex;align-items:center;gap:18px;font-size:14px;flex-wrap:wrap}
+#status{font-weight:bold}
+canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max-height:calc(100vh - 100px);image-rendering:auto}
+#help{position:fixed;left:10px;bottom:8px;color:#aaa;font-size:12px}
+#scores{display:flex;gap:10px;font-size:13px}
+.score{padding:2px 8px;border-radius:4px;background:#222}
+#resetBtn{display:none;padding:6px 14px;font-size:14px;font-weight:bold;border-radius:6px;border:none;
+  background:#ffd60a;color:#111;cursor:pointer}
+#resetBtn:hover{background:#ffe14d}
+
+#lobbyPanel{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+  background:rgba(20,20,20,.94);border:2px solid #444;border-radius:10px;
+  padding:20px 26px;display:none;flex-direction:column;gap:12px;align-items:center;z-index:5;color:#eee;
+  min-width:260px}
+#lobbyPanel h3{margin:0 0 4px 0;font-size:17px}
+#colorRow{display:flex;gap:7px;flex-wrap:wrap;justify-content:center;max-width:280px}
+.colorBtn{width:30px;height:30px;border-radius:6px;border:2px solid #555;cursor:pointer}
+.colorBtn.selected{border-color:#fff;box-shadow:0 0 0 2px #fff}
+#nameInput{width:110px;text-align:center;font-size:15px;padding:6px;border-radius:4px;border:1px solid #666;
+  background:#222;color:#eee;text-transform:uppercase}
+#nameInput.missing{border-color:#e63946;box-shadow:0 0 0 1px #e63946}
+#lobbyHint{font-size:12px;color:#aaa;text-align:center;max-width:240px}
+#canvasWrap{position:relative}
+#pauseOverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
+  background:rgba(0,0,0,.45);color:#fff;font-size:26px;font-weight:bold;font-family:Arial,sans-serif;z-index:4}
+</style></head>
+<body><div id="wrap">
+<div id="top"><span>Tank Trouble LAN</span><span id="status">Connecting...</span><span id="players"></span><span id="scores"></span><button id="resetBtn">Play Again</button></div>
+<div id="canvasWrap">
+<canvas id="game" width="1000" height="650"></canvas>
+<div id="lobbyPanel">
+  <h3>Set up your tank</h3>
+  <div id="colorRow"></div>
+  <input id="nameInput" maxlength="6" placeholder="NAME">
+  <div id="lobbyHint">Type a name (required), press Enter to confirm, pick a free color, then press R when ready</div>
+</div>
+<div id="pauseOverlay">PAUSED</div>
+</div>
+</div>
+<div id="help">Move: WASD / Arrows &nbsp; Fire/Use: Space &nbsp; R = ready/start &nbsp; P = host pause &nbsp; Grab boxes on the map for Nitro (yellow), Laser (blue), Homing Missile (red), Shield (green), RC Rocket (purple), A-Bomb (brown), Power Beam (pink), Machine Gun (teal), Health Pack (green +), Teleport (light blue), Super Bullet (indigo), Clean (dark red), Airstrike (black), Ghost (slate gray), Bouncing Laser (amber), Hacking (neon green), Freeze (light blue), Black Hole (white), Flamethrower (neon red), Wall (stone gray), Slide (dark oily brown), Cannon Cap (red), Clone (cyan), Shock (yellow), Darkness (dark brown), Time Stop (amber)</div>
+<script>
+const canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
+const statusEl=document.getElementById('status'),playersEl=document.getElementById('players'),scoresEl=document.getElementById('scores');
+const resetBtn=document.getElementById('resetBtn');
+const lobbyPanel=document.getElementById('lobbyPanel'),colorRow=document.getElementById('colorRow'),nameInput=document.getElementById('nameInput');
+const pauseOverlay=document.getElementById('pauseOverlay');
+const W=canvas.width,H=canvas.height;
+const GRID_COLS=9, GRID_ROWS=6, GRID_MARGIN_X=50, GRID_MARGIN_Y=40;
+const DARKNESS_LIGHT_RADIUS=110; // size of the visible circle during darkness
+const GRID_CELL_W=(W-GRID_MARGIN_X*2)/GRID_COLS, GRID_CELL_H=(H-GRID_MARGIN_Y*2)/GRID_ROWS;
+let ws, myId=null, maze=[];
+// Normally "my tank" is myId, but while piloting a clone, all the
+// targeting/visibility rendering below should track the clone instead -
+// that's the entity actually being controlled right now.
+// Server timestamps are in "sim time" (real time minus accumulated time-stop
+// freezes). Comparing them against raw Date.now() would make every timed
+// effect jump forward after a time stop, so convert first.
+function simClock(){ return Date.now()-(state.simOffset||0); }
+function myControlledId(){
+  if(myId==null) return null;
+  const me=state.players[myId];
+  if(me && me.cloneId!=null && state.players[me.cloneId]) return me.cloneId;
+  return myId;
+}
+let state={gamePhase:'lobby',players:{},bullets:[],powerups:[],lasers:[],colors:[],shrapnel:[]};
+let prevAlive={};
+let explosions=[];
+let muzzleSmokes=[];
+let prevBulletIds=new Set();
+let abombBlasts=[];
+let seenExplosionIds=new Set();
+let cleanWaves=[];
+let seenCleanEventIds=new Set();
+let airstrikeExplosions=[];
+let seenAirstrikeIds=new Set();
+let blackHoleFades=[];
+let seenBlackHoleIds=new Set();
+let myColor=null, colorsBuilt=false, colorPicked=false;
+
+const COLOR_NAMES={'#e63946':'Red','#3a86ff':'Blue','#2ecc71':'Green','#f4a261':'Orange',
+  '#ffd60a':'Yellow','#fb8500':'Orange','#8338ec':'Purple','#ff5da2':'Pink','#8d5524':'Brown'};
+
+// ---- tank texture frames ----
+const tankFrames=[new Image(),new Image()];
+tankFrames[0].src='/assets/tank1.png';
+tankFrames[1].src='/assets/tank2.png';
+let framesReady=[false,false];
+tankFrames[0].onload=()=>framesReady[0]=true;
+tankFrames[1].onload=()=>framesReady[1]=true;
+
+const keys={};
+addEventListener('keydown',e=>{
+  if(document.activeElement===nameInput) return; // typing a name shouldn't trigger game keys
+  keys[e.code]=true;
+  if(['Space','KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
+  if(e.code==='KeyR'){
+    e.preventDefault();
+    const me=myId!=null?state.players[myId]:null;
+    if(state.gamePhase==='lobby' && me && !me.ready && !(me.name&&me.name.length>0)){
+      nameInput.classList.add('missing');
+      nameInput.focus();
+    } else {
+      send({type:'ready'});
+    }
+  }
+  if(e.code==='KeyP') send({type:'pause'});
+});
+addEventListener('keyup',e=>{ if(document.activeElement!==nameInput) keys[e.code]=false; });
+resetBtn.onclick=()=>send({type:'reset'});
+
+nameInput.addEventListener('input',()=>{
+  nameInput.value=nameInput.value.toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,6);
+  if(nameInput.value.length>0) nameInput.classList.remove('missing');
+  send({type:'setName',name:nameInput.value});
+});
+nameInput.addEventListener('keydown',e=>{
+  e.stopPropagation(); // never let typing in the name box reach the game's WASD/R/P handlers
+  if(e.key==='Enter') nameInput.blur(); // confirm the name and hand control back to the game
+});
+
+function buildColorPicker(colors){
+  colorRow.innerHTML='';
+  for(const c of colors){
+    const b=document.createElement('div');
+    b.className='colorBtn';
+    b.style.background=c;
+    b.onclick=()=>{ colorPicked=true; send({type:'setColor',color:c}); };
+    b.dataset.color=c;
+    colorRow.appendChild(b);
+  }
+  colorsBuilt=true;
+}
+
+function connect(){
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+  ws.onopen=()=>{statusEl.textContent='Connected';};
+  ws.onclose=()=>{statusEl.textContent='Disconnected — refresh';};
+  ws.onerror=()=>statusEl.textContent='Connection error';
+  ws.onmessage=e=>{
+    const m=JSON.parse(e.data);
+    if(m.type==='welcome') myId=m.id;
+    if(m.type==='full') statusEl.textContent='Server full (max 4 players)';
+    if(m.type==='state'){
+      const newPlayers=m.state.players;
+      for(const [id,np] of Object.entries(newPlayers)){
+        if(prevAlive[id]===true && np.alive===false){
+          explosions.push(makeExplosion(np.x,np.y));
+        }
+        prevAlive[id]=np.alive;
+      }
+      for(const id in prevAlive) if(!(id in newPlayers)) delete prevAlive[id];
+
+      const newBulletIds=new Set();
+      for(const b of (m.state.bullets||[])){
+        if(b.type!=='normal'||b.id==null) continue;
+        newBulletIds.add(b.id);
+        if(!prevBulletIds.has(b.id)) muzzleSmokes.push(makeMuzzleSmoke(b.x,b.y,b.a));
+      }
+      prevBulletIds=newBulletIds;
+
+      for(const s of (m.state.shrapnel||[])){
+        if(!seenExplosionIds.has(s.explosionId)){
+          seenExplosionIds.add(s.explosionId);
+          abombBlasts.push(makeAbombBlast(s.cx,s.cy));
+        }
+      }
+
+      for(const c of (m.state.cleanEvents||[])){
+        if(!seenCleanEventIds.has(c.id)){
+          seenCleanEventIds.add(c.id);
+          cleanWaves.push({x:c.x,y:c.y,start:performance.now()});
+        }
+      }
+
+      for(const s of (m.state.airstrikes||[])){
+        if(!seenAirstrikeIds.has(s.id)){
+          seenAirstrikeIds.add(s.id);
+          airstrikeExplosions.push({cx:s.cx,cy:s.cy,confirmTime:s.confirmTime,particles:makeAirstrikeParticles()});
+        }
+      }
+
+      for(const bh of (m.state.blackHoles||[])){
+        if(!seenBlackHoleIds.has(bh.id)){
+          seenBlackHoleIds.add(bh.id);
+          blackHoleFades.push({col:bh.col,row:bh.row,start:performance.now()});
+        }
+      }
+
+      state=m.state;
+      if(m.state.maze) maze=m.state.maze;
+
+      if(!colorsBuilt && m.state.colors && m.state.colors.length) buildColorPicker(m.state.colors);
+      const me=myId!=null?newPlayers[myId]:null;
+      if(me){
+        myColor=me.color;
+        for(const b of colorRow.children) b.classList.toggle('selected', b.dataset.color===me.color);
+        if(document.activeElement!==nameInput) nameInput.value=me.name||'';
+      }
+      lobbyPanel.style.display = (state.gamePhase==='lobby' && myId!=null) ? 'flex' : 'none';
+      if(me){
+        if(me.ready) lobbyPanel.style.background='rgba(30,120,45,.95)'; // green - ready
+        else if(colorPicked && me.name && me.name.length>0) lobbyPanel.style.background='rgba(150,30,30,.95)'; // red - set up, not ready yet
+        else lobbyPanel.style.background='rgba(20,20,20,.94)'; // neutral - still choosing
+      }
+      pauseOverlay.style.display = state.paused ? 'flex' : 'none';
+      pauseOverlay.textContent = state.hostId===myId ? 'PAUSED (press P to resume)' : 'PAUSED';
+
+      const realEntries=Object.entries(state.players).filter(([,p])=>!p.isClone);
+      playersEl.textContent=`Players: ${realEntries.length}/4`;
+      scoresEl.innerHTML='';
+      for(const [id,p] of realEntries){
+        const el=document.createElement('span');
+        el.className='score';
+        el.style.color=p.color;
+        const label=p.name?p.name:('P'+id);
+        el.textContent=`${label}${id==myId?' (you)':''}${state.hostId==id?' [host]':''}: ${p.score}/${state.winScore||10}`;
+        scoresEl.appendChild(el);
+      }
+      statusEl.textContent = state.paused ? 'Paused' : state.gamePhase==='gameover' ? 'Game over' :
+        state.gamePhase==='lobby' ? 'Waiting to start' : `Round ${state.roundNumber}`;
+      resetBtn.style.display = state.gamePhase==='gameover' ? 'inline-block' : 'none';
+    }
+  }
+}
+function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
+
+function controls(){
+  return {
+    up: !!(keys.KeyW||keys.ArrowUp), down: !!(keys.KeyS||keys.ArrowDown),
+    left: !!(keys.KeyA||keys.ArrowLeft), right: !!(keys.KeyD||keys.ArrowRight),
+    shoot: !!keys.Space
+  };
+}
+let last=0;
+function frame(t){
+  if(t-last>33){ send({type:'input',input:controls()}); last=t; }
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+// ---- explosion particle system ----
+const EXPLOSION_COLORS=['#ffe066','#ffd60a','#ffb703','#fb8500','#f4a261','#e63946','#e85d04','#d62828'];
+function makeExplosion(x,y){
+  const particles=[];
+  const n=26+Math.floor(Math.random()*8);
+  for(let i=0;i<n;i++){
+    const ang=Math.random()*Math.PI*2;
+    const speed=40+Math.random()*160; // px/sec
+    particles.push({
+      ang, speed,
+      dist:Math.random()*4,
+      size:2+Math.random()*4,
+      color:EXPLOSION_COLORS[Math.floor(Math.random()*EXPLOSION_COLORS.length)],
+      life:400+Math.random()*550, // ms, individual particle lifetime
+      delay:Math.random()*80
+    });
+  }
+  // a few bigger fiery chunks for variety
+  for(let i=0;i<6;i++){
+    const ang=Math.random()*Math.PI*2;
+    particles.push({
+      ang, speed:20+Math.random()*70,
+      dist:Math.random()*3,
+      size:5+Math.random()*5,
+      color:EXPLOSION_COLORS[Math.floor(Math.random()*3)],
+      life:500+Math.random()*400,
+      delay:Math.random()*60
+    });
+  }
+  return {x,y,start:performance.now(),particles};
+}
+
+// ---- muzzle smoke (small puff when a regular bullet is fired) ----
+function makeMuzzleSmoke(x,y,a){
+  const particles=[];
+  const back=a+Math.PI; // smoke drifts back away from the direction of fire
+  const n=7+Math.floor(Math.random()*5);
+  for(let i=0;i<n;i++){
+    const spread=(Math.random()-0.5)*1.4; // fan out around the backward direction
+    const ang=back+spread;
+    particles.push({
+      ang, speed:8+Math.random()*26,
+      dist:Math.random()*2,
+      size:1.5+Math.random()*2.2,
+      growTo:3+Math.random()*3,
+      life:250+Math.random()*250, // total 500ms max
+      delay:Math.random()*60
+    });
+  }
+  return {x,y,start:performance.now(),particles};
+}
+
+// ---- a-bomb detonation (~1s, all gray/black, no color) ----
+const ABOMB_BLAST_COLORS=['#3a3a3a','#555555','#7a7a7a','#2b2b2b','#111111','#999999'];
+function makeAbombBlast(x,y){
+  const particles=[];
+  const n=22;
+  for(let i=0;i<n;i++){
+    const ang=Math.random()*Math.PI*2;
+    const speed=40+Math.random()*150;
+    particles.push({
+      ang, speed,
+      dist:Math.random()*4,
+      size:2+Math.random()*4,
+      color:ABOMB_BLAST_COLORS[Math.floor(Math.random()*ABOMB_BLAST_COLORS.length)],
+      life:350+Math.random()*500,
+      delay:Math.random()*70
+    });
+  }
+  return {x,y,start:performance.now(),particles};
+}
+
+// ---- airstrike detonation (~0.5s, big and orange) ----
+const AIRSTRIKE_EXPLOSION_COLORS=['#ff8c00','#ff7f11','#ffa500','#ff6a00','#ffb347','#ff4500'];
+function makeAirstrikeParticles(){
+  const particles=[];
+  const n=30;
+  for(let i=0;i<n;i++){
+    const ang=Math.random()*Math.PI*2;
+    const speed=60+Math.random()*220;
+    particles.push({
+      ang, speed,
+      dist:Math.random()*6,
+      size:3+Math.random()*6,
+      color:AIRSTRIKE_EXPLOSION_COLORS[Math.floor(Math.random()*AIRSTRIKE_EXPLOSION_COLORS.length)],
+      life:250+Math.random()*220, // fits within the 0.5s window
+      delay:Math.random()*60
+    });
+  }
+  return particles;
+}
+
+// ---- color helpers (used to age bullets toward red over their lifespan) ----
+function hexToRgb(hex){
+  hex=hex.replace('#','');
+  if(hex.length===3) hex=hex.split('').map(c=>c+c).join('');
+  const num=parseInt(hex,16);
+  return [(num>>16)&255,(num>>8)&255,num&255];
+}
+function lerpColor(hexA,hexB,t){
+  t=Math.max(0,Math.min(1,t));
+  const a=hexToRgb(hexA), b=hexToRgb(hexB);
+  const r=Math.round(a[0]+(b[0]-a[0])*t);
+  const g=Math.round(a[1]+(b[1]-a[1])*t);
+  const bl=Math.round(a[2]+(b[2]-a[2])*t);
+  return `rgb(${r},${g},${bl})`;
+}
+
+// ---- small icon drawers for powerup boxes ----
+// unique per-type box background color; health keeps its own custom look
+const POWERUP_BOX_COLORS = {
+  laser: '#153e75',       // dark blue
+  homing: '#c1121f',      // red
+  shield: '#14532d',      // dark green
+  rc: '#ea580c',          // orange
+  abomb: '#4a2c17',       // dark brown
+  powerbeam: '#ec4899',   // pink
+  mg: '#3f3f46',          // dark gray
+  teleport: '#2563eb',    // mid blue
+  superbullet: '#7c3aed', // purple
+  clean: '#7f1d1d',       // dark red
+  airstrike: '#000000',   // black
+  ghost: '#6b7280',       // gray
+  bouncelaser: '#d8c3a5', // beige
+  hacking: '#39ff14',     // neon green
+  nitro: '#eab308',       // golden yellow
+  freeze: '#bde4ff',      // very light blue
+  blackhole: '#ffffff',   // white
+  flamethrower: '#ff073a', // neon red
+  wall: '#ffffff',         // white
+  slide: '#d1d5db',        // light gray
+  cannoncap: '#ffffff',    // white
+  clone: '#bfe3f5',        // light blue
+  shock: '#fdf3a7',        // light yellow
+  darkness: '#4a3218',     // dark brown
+  timestop: '#c8a26b'      // light brown
+};
+function drawPowerupIcon(pu){
+  const s=14;
+  ctx.save();
+  ctx.translate(pu.x,pu.y);
+  ctx.scale(1.25,1.25); // 25% bigger overall
+  ctx.fillStyle=POWERUP_BOX_COLORS[pu.type]||'#222';
+  ctx.strokeStyle='#000';
+  ctx.lineWidth=1;
+  ctx.fillRect(-s/2,-s/2,s,s);
+  ctx.strokeRect(-s/2,-s/2,s,s);
+  const iconColor=(pu.type==='freeze'||pu.type==='blackhole'||pu.type==='flamethrower'||pu.type==='slide'||pu.type==='clone'||pu.type==='shock'||pu.type==='timestop')?'#000':'#fff'; // these keep their glyph black
+  ctx.fillStyle=iconColor;
+  ctx.strokeStyle=iconColor;
+  if(pu.type==='nitro'){
+    ctx.beginPath();
+    ctx.moveTo(1,-5); ctx.lineTo(-3,0.5); ctx.lineTo(-0.5,0.5);
+    ctx.lineTo(-1,5); ctx.lineTo(3,-0.5); ctx.lineTo(0.5,-0.5);
+    ctx.closePath(); ctx.fill();
+  } else if(pu.type==='laser'){
+    ctx.fillRect(-1,-5,2,10);
+  } else if(pu.type==='homing'){
+    // simple aim/target reticle: circle + center dot + four crosshair ticks
+    ctx.lineWidth=1.3;
+    ctx.beginPath(); ctx.arc(0,0,4.2,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,0,1,0,Math.PI*2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(0,-6.5); ctx.lineTo(0,-4.5);
+    ctx.moveTo(0,6.5); ctx.lineTo(0,4.5);
+    ctx.moveTo(-6.5,0); ctx.lineTo(-4.5,0);
+    ctx.moveTo(6.5,0); ctx.lineTo(4.5,0);
+    ctx.stroke();
+  } else if(pu.type==='shield'){
+    ctx.beginPath();
+    ctx.moveTo(0,-5); ctx.lineTo(4,-3); ctx.lineTo(4,1);
+    ctx.quadraticCurveTo(4,4.5,0,5.5);
+    ctx.quadraticCurveTo(-4,4.5,-4,1);
+    ctx.lineTo(-4,-3);
+    ctx.closePath(); ctx.fill();
+  } else if(pu.type==='rc'){
+    ctx.lineWidth=1.3;
+    ctx.beginPath(); ctx.arc(0,2.5,1.4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0,2.5,3.2,Math.PI*1.15,Math.PI*1.85); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,2.5,5.4,Math.PI*1.15,Math.PI*1.85); ctx.stroke();
+  } else if(pu.type==='abomb'){
+    // simple 10-spike white star
+    const spikes=10, outerR=6, innerR=2.4;
+    ctx.beginPath();
+    for(let i=0;i<spikes*2;i++){
+      const r=(i%2===0)?outerR:innerR;
+      const ang=(Math.PI*i)/spikes - Math.PI/2;
+      const px=Math.cos(ang)*r, py=Math.sin(ang)*r;
+      if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.closePath();
+    ctx.fill();
+  } else if(pu.type==='powerbeam'){
+    // 5 thin horizontal lines, equally spaced
+    ctx.strokeStyle='#fff';
+    ctx.lineWidth=1.1;
+    const ys=[-5,-2.5,0,2.5,5];
+    for(const y of ys){
+      ctx.beginPath(); ctx.moveTo(-6,y); ctx.lineTo(6,y); ctx.stroke();
+    }
+  } else if(pu.type==='mg'){
+    // 3 small circles in a row
+    ctx.beginPath(); ctx.arc(-5,0,1.6,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(0,0,1.6,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(5,0,1.6,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='health'){
+    // green rectangle with a white plus sign
+    ctx.fillStyle='#2ecc71';
+    ctx.fillRect(-6,-6,12,12);
+    ctx.fillStyle='#fff';
+    ctx.fillRect(-1.2,-4.5,2.4,9);
+    ctx.fillRect(-4.5,-1.2,9,2.4);
+  } else if(pu.type==='teleport'){
+    // simple white spiral
+    ctx.strokeStyle='#fff';
+    ctx.lineWidth=1.3;
+    ctx.beginPath();
+    const turns=2.1, steps=40;
+    for(let i=0;i<=steps;i++){
+      const t=i/steps;
+      const ang=t*Math.PI*2*turns;
+      const r=1+t*5.5;
+      const x=Math.cos(ang)*r, y=Math.sin(ang)*r;
+      if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
+    ctx.stroke();
+  } else if(pu.type==='superbullet'){
+    // white circle with a black upward-pointing triangle inside
+    ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(0,-3.4); ctx.lineTo(3,2.6); ctx.lineTo(-3,2.6);
+    ctx.closePath();
+    ctx.fillStyle='#000'; ctx.fill();
+  } else if(pu.type==='clean'){
+    // white circle with a black X inside
+    ctx.beginPath(); ctx.arc(0,0,6,0,Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.6; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo(-3,-3); ctx.lineTo(3,3);
+    ctx.moveTo(3,-3); ctx.lineTo(-3,3);
+    ctx.stroke();
+  } else if(pu.type==='airstrike'){
+    // simple white top-down fighter jet silhouette, nose pointing up
+    ctx.beginPath();
+    ctx.moveTo(0,-7);
+    ctx.lineTo(1,-4);
+    ctx.lineTo(7,1);
+    ctx.lineTo(7,2.3);
+    ctx.lineTo(1.4,0.6);
+    ctx.lineTo(1.6,4.5);
+    ctx.lineTo(4,7);
+    ctx.lineTo(4,8);
+    ctx.lineTo(0.8,6.2);
+    ctx.lineTo(0,7);
+    ctx.lineTo(-0.8,6.2);
+    ctx.lineTo(-4,8);
+    ctx.lineTo(-4,7);
+    ctx.lineTo(-1.6,4.5);
+    ctx.lineTo(-1.4,0.6);
+    ctx.lineTo(-7,2.3);
+    ctx.lineTo(-7,1);
+    ctx.lineTo(-1,-4);
+    ctx.closePath();
+    ctx.fillStyle='#fff'; ctx.fill();
+  } else if(pu.type==='ghost'){
+    // simple minimal ghost silhouette: rounded head, wavy skirt, two eyes
+    ctx.beginPath();
+    ctx.arc(0,-1,5,Math.PI,0,false);
+    ctx.lineTo(5,5);
+    ctx.lineTo(3.3,3);
+    ctx.lineTo(1.7,5);
+    ctx.lineTo(0,3);
+    ctx.lineTo(-1.7,5);
+    ctx.lineTo(-3.3,3);
+    ctx.lineTo(-5,5);
+    ctx.closePath();
+    ctx.fillStyle='#fff'; ctx.fill();
+    ctx.fillStyle='#222';
+    ctx.beginPath(); ctx.arc(-1.8,-1,0.9,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(1.8,-1,0.9,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='bouncelaser'){
+    // 6 white lines like an extended W (extra spike), zigzag
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1.3; ctx.lineJoin='round'; ctx.lineCap='round';
+    ctx.beginPath();
+    const xs=[-7,-4.67,-2.33,0,2.33,4.67,7];
+    const ys=[-3,3,-3,3,-3,3,-3];
+    ctx.moveTo(xs[0],ys[0]);
+    for(let i=1;i<xs.length;i++) ctx.lineTo(xs[i],ys[i]);
+    ctx.stroke();
+  } else if(pu.type==='hacking'){
+    // single bigger line of white binary text
+    ctx.fillStyle='#fff';
+    ctx.font='7px monospace';
+    ctx.textAlign='center';
+    ctx.textBaseline='middle';
+    ctx.fillText('1011',0,0.3);
+  } else if(pu.type==='freeze'){
+    // minimal snowflake: 3 crossing lines (6 rays) with small side ticks
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.2; ctx.lineCap='round';
+    for(let i=0;i<3;i++){
+      const ang=(Math.PI/3)*i;
+      const dx=Math.cos(ang)*6.5, dy=Math.sin(ang)*6.5;
+      ctx.beginPath();
+      ctx.moveTo(-dx,-dy); ctx.lineTo(dx,dy);
+      ctx.stroke();
+      const perpAng=ang+Math.PI/2;
+      const pdx=Math.cos(perpAng)*1.8, pdy=Math.sin(perpAng)*1.8;
+      for(const sign of [1,-1]){
+        const bx=dx*sign*0.7, by=dy*sign*0.7;
+        ctx.beginPath();
+        ctx.moveTo(bx-pdx,by-pdy); ctx.lineTo(bx+pdx,by+pdy);
+        ctx.stroke();
+      }
+    }
+  } else if(pu.type==='blackhole'){
+    // white box, black dot
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.arc(0,0,3.5,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='flamethrower'){
+    // minimal black water-droplet silhouette
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.moveTo(0,-6);
+    ctx.quadraticCurveTo(5,-1,4,3);
+    ctx.arc(0,3,4,0,Math.PI,false);
+    ctx.quadraticCurveTo(-5,-1,0,-6);
+    ctx.closePath();
+    ctx.fill();
+  } else if(pu.type==='wall'){
+    // white box with a thick mid-gray-stroked white inner rectangle
+    ctx.fillStyle='#fff';
+    ctx.strokeStyle='#6b7280';
+    ctx.lineWidth=2.5;
+    ctx.fillRect(-4,-4,8,8);
+    ctx.strokeRect(-4,-4,8,8);
+  } else if(pu.type==='slide'){
+    // small irregular soft blob, like an oil stain - deliberately lopsided,
+    // with uneven lobes and a couple of splatter specks
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.moveTo(-5.5,-0.5);
+    ctx.bezierCurveTo(-6.5,-4.5,-2.5,-6,0.5,-4.5);
+    ctx.bezierCurveTo(2,-6.5,6,-4,4.5,-1.5);
+    ctx.bezierCurveTo(7.5,-0.5,6.5,3,3,3.5);
+    ctx.bezierCurveTo(3.5,6,0,7,-1.5,4.5);
+    ctx.bezierCurveTo(-4.5,6,-7,2.5,-5.5,-0.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath(); ctx.arc(6,4.5,1.1,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(-6.5,4,0.7,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='cannoncap'){
+    // thin red "no parking" circle with a 45-degree slash, small black dot below
+    ctx.strokeStyle='#e01010';
+    ctx.lineWidth=1.1;
+    ctx.beginPath(); ctx.arc(0,-1.5,4.2,0,Math.PI*2); ctx.stroke();
+    const d=4.2*Math.SQRT1_2;
+    ctx.beginPath();
+    ctx.moveTo(-d,-1.5-d); ctx.lineTo(d,-1.5+d);
+    ctx.stroke();
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.arc(0,5.5,1.6,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='clone'){
+    // two overlapping black circles with white strokes, one offset diagonally
+    ctx.lineWidth=1.2;
+    for(const [ox,oy] of [[2,2],[-2,-2]]){
+      ctx.beginPath(); ctx.arc(ox,oy,4,0,Math.PI*2);
+      ctx.fillStyle='#000'; ctx.fill();
+      ctx.strokeStyle='#fff'; ctx.stroke();
+    }
+  } else if(pu.type==='shock'){
+    // 3 black bars in a row with a thin white line running across them
+    ctx.fillStyle='#000';
+    for(const bx of [-6,-1.5,3]) ctx.fillRect(bx,-3.5,3.5,7);
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(-7.5,0); ctx.lineTo(7.5,0); ctx.stroke();
+  } else if(pu.type==='darkness'){
+    // minimal white lightbulb
+    ctx.fillStyle='#fff';
+    ctx.beginPath(); ctx.arc(0,-2,4,0,Math.PI*2); ctx.fill();
+    ctx.fillRect(-2,1.5,4,3);
+    ctx.fillRect(-2.6,4.8,5.2,1.2);
+    ctx.fillRect(-1.6,6.4,3.2,1.1);
+  } else if(pu.type==='timestop'){
+    // minimal sand hourglass: two triangles meeting at the neck, caps top and bottom, sand in the lower half
+    ctx.fillStyle='#000';
+    ctx.fillRect(-5,-7,10,1.4);
+    ctx.fillRect(-5,5.6,10,1.4);
+    ctx.beginPath();
+    ctx.moveTo(-4,-5.6); ctx.lineTo(4,-5.6); ctx.lineTo(0.5,0); ctx.lineTo(4,5.6); ctx.lineTo(-4,5.6); ctx.lineTo(-0.5,0);
+    ctx.closePath();
+    ctx.lineWidth=1.1; ctx.strokeStyle='#000'; ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(-3,5.6); ctx.lineTo(3,5.6); ctx.lineTo(0.9,2.6); ctx.lineTo(-0.9,2.6);
+    ctx.closePath(); ctx.fill();
+    ctx.fillRect(-0.4,-2.2,0.8,4);
+  }
+  ctx.restore();
+}
+
+function render(){
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle='#e8e8e8'; ctx.fillRect(0,0,W,H);
+  ctx.strokeStyle='#222'; ctx.lineWidth=2; ctx.strokeRect(1,1,W-2,H-2);
+
+  ctx.fillStyle='#444';
+  for(const w of maze) ctx.fillRect(w.x,w.y,w.w,w.h);
+
+  // airstrike: the targeted tile fades to light red over the 1s warning
+  // window - visible to everyone, computed directly from server state
+  for(const s of state.airstrikes||[]){
+    const age=simClock()-s.confirmTime;
+    if(age<1000){
+      const prog=Math.max(0,Math.min(1,age/1000));
+      const tileX=GRID_MARGIN_X+s.col*GRID_CELL_W, tileY=GRID_MARGIN_Y+s.row*GRID_CELL_H;
+      ctx.fillStyle=`rgba(255,70,70,${(0.55*prog).toFixed(3)})`;
+      ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    }
+  }
+
+  // shock: light gray preview of the row/column that would be hit
+  for(const p of Object.values(state.players||{})){
+    if(!p.shockLine) continue;
+    for(const t of p.shockLine){
+      ctx.fillStyle='rgba(190,190,190,0.45)';
+      ctx.fillRect(GRID_MARGIN_X+t.col*GRID_CELL_W,GRID_MARGIN_Y+t.row*GRID_CELL_H,GRID_CELL_W,GRID_CELL_H);
+    }
+  }
+
+  // shock: tiles light up red one by one and stay lit until the bolt finishes
+  for(const sh of state.shocks||[]){
+    for(let i=0;i<=sh.litUpTo && i<sh.tiles.length;i++){
+      const t=sh.tiles[i];
+      ctx.fillStyle='rgba(225,30,30,0.65)';
+      ctx.fillRect(GRID_MARGIN_X+t.col*GRID_CELL_W,GRID_MARGIN_Y+t.row*GRID_CELL_H,GRID_CELL_W,GRID_CELL_H);
+    }
+  }
+
+  // black hole: light gray highlight; wall: soft green (ok) or red (blocked) -
+  // both track whichever tile is currently in front of the tank holding the
+  // powerup, visible to everyone, recomputed fresh from server state every frame
+  for(const p of Object.values(state.players||{})){
+    if(!p.frontTile) continue;
+    const tileX=GRID_MARGIN_X+p.frontTile.col*GRID_CELL_W, tileY=GRID_MARGIN_Y+p.frontTile.row*GRID_CELL_H;
+    if(p.powerup==='wall'){
+      ctx.fillStyle=p.wallBlocked?'rgba(230,60,60,0.4)':'rgba(60,200,90,0.4)';
+    } else {
+      ctx.fillStyle='rgba(190,190,190,0.5)';
+    }
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+  }
+
+  // placed walls: solid blocks, tinting from gray (full health) to red (near
+  // destroyed) as they take damage - same scale idea as the aging bullets
+  for(const w of state.placedWalls||[]){
+    const tileX=GRID_MARGIN_X+w.col*GRID_CELL_W, tileY=GRID_MARGIN_Y+w.row*GRID_CELL_H;
+    const maxHp=w.maxHp||600;
+    const damageFrac=1-Math.max(0,Math.min(1,w.hp/maxHp));
+    ctx.fillStyle=lerpColor('#5b5f66','#ff0000',damageFrac);
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle=lerpColor('#3a3d42','#8a0000',damageFrac);
+    ctx.lineWidth=2;
+    ctx.strokeRect(tileX+1,tileY+1,GRID_CELL_W-2,GRID_CELL_H-2);
+  }
+
+  for(const pu of state.powerups||[]) drawPowerupIcon(pu);
+
+  for(const l of state.lasers||[]){
+    if(l.kind==='powerbeam'){
+      ctx.save();
+      ctx.lineCap='round';
+      ctx.globalAlpha=0.5; ctx.strokeStyle=l.color; ctx.lineWidth=5;
+      ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
+      ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=1.6;
+      ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
+      ctx.restore();
+      continue;
+    }
+    ctx.save();
+    ctx.lineCap='round';
+    ctx.globalAlpha=0.22; ctx.strokeStyle=l.color; ctx.lineWidth=60;
+    ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
+    ctx.globalAlpha=0.85; ctx.strokeStyle=l.color; ctx.lineWidth=10;
+    ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
+    ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
+    ctx.restore();
+  }
+
+  // bouncing laser: thin, very light blue, drawn as its full live path -
+  // server sends the growing polyline fresh every tick
+  for(const bl of state.bounceLasers||[]){
+    if(!bl.points || bl.points.length<2) continue;
+    ctx.save();
+    ctx.lineCap='round'; ctx.lineJoin='round';
+    ctx.globalAlpha=0.35; ctx.strokeStyle='#0a1f5c'; ctx.lineWidth=6;
+    ctx.beginPath();
+    ctx.moveTo(bl.points[0].x,bl.points[0].y);
+    for(let i=1;i<bl.points.length;i++) ctx.lineTo(bl.points[i].x,bl.points[i].y);
+    ctx.stroke();
+    ctx.globalAlpha=0.95; ctx.strokeStyle='#1e3a8a'; ctx.lineWidth=2;
+    ctx.beginPath();
+    ctx.moveTo(bl.points[0].x,bl.points[0].y);
+    for(let i=1;i<bl.points.length;i++) ctx.lineTo(bl.points[i].x,bl.points[i].y);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // flamethrower: simple animated flame - a handful of flickering, tapering
+  // blobs spaced along the tank's current live length, orange/red, always
+  // recomputed from live server state (no client-side caching needed)
+  const flameClockNow=Date.now();
+  for(const p of Object.values(state.players||{})){
+    if(!p.flameActive || !(p.flameLen>0)) continue;
+    const cosA=Math.cos(p.a), sinA=Math.sin(p.a);
+    const segments=20; // tripled+ so circles overlap along the full length instead of leaving gaps
+    for(let i=0;i<segments;i++){
+      const t=(i+0.5)/segments;
+      const dist=15+t*p.flameLen; // 15 ~= tank radius, so it starts at the tank's edge
+      const flicker=0.7+0.3*Math.sin(flameClockNow/60+i*1.7+p.x*0.01);
+      const segX=p.x+cosA*dist, segY=p.y+sinA*dist;
+      const w=(1-t*0.5)*13*flicker;
+      ctx.save();
+      ctx.globalAlpha=0.85*(1-t*0.3);
+      ctx.fillStyle=i%2===0?'#ff6a00':'#ff2d00';
+      ctx.beginPath();
+      ctx.arc(segX,segY,w,0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // continuous thin aim line while carrying (but not yet firing) the laser
+  const me=state.players[myControlledId()]||null;
+  if(me && me.alive && me.powerup==='laser'){
+    const aimLen=((GRID_CELL_W+GRID_CELL_H)/2)*3; // 3 tiles long
+    ctx.save();
+    ctx.setLineDash([6,6]);
+    ctx.strokeStyle='rgba(230,20,20,0.75)';
+    ctx.lineWidth=1.5;
+    ctx.beginPath();
+    ctx.moveTo(me.x,me.y);
+    ctx.lineTo(me.x+Math.cos(me.a)*aimLen, me.y+Math.sin(me.a)*aimLen);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // teleport tile-picker: only the owning player ever sees their own cursor/highlight
+  if(me && me.alive && me.teleportTargeting){
+    const cx=me.teleportCursorX, cy=me.teleportCursorY;
+    const col=Math.min(GRID_COLS-1,Math.max(0,Math.floor((cx-GRID_MARGIN_X)/GRID_CELL_W)));
+    const row=Math.min(GRID_ROWS-1,Math.max(0,Math.floor((cy-GRID_MARGIN_Y)/GRID_CELL_H)));
+    const tileX=GRID_MARGIN_X+col*GRID_CELL_W, tileY=GRID_MARGIN_Y+row*GRID_CELL_H;
+    ctx.save();
+    ctx.fillStyle='rgba(80,170,255,0.35)';
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='rgba(80,170,255,0.9)';
+    ctx.lineWidth=2;
+    ctx.strokeRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.restore();
+
+    // thick blue cross marking the exact cursor point, floating above the tank
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.strokeStyle='#2b7de9';
+    ctx.lineWidth=4;
+    ctx.lineCap='round';
+    const armLen=10;
+    ctx.beginPath();
+    ctx.moveTo(-armLen,-armLen); ctx.lineTo(armLen,armLen);
+    ctx.moveTo(armLen,-armLen); ctx.lineTo(-armLen,armLen);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // hacking tile-picker: same private-cursor mechanic as teleport, green-themed
+  if(me && me.alive && me.hackTargeting){
+    const cx=me.hackCursorX, cy=me.hackCursorY;
+    const col=Math.min(GRID_COLS-1,Math.max(0,Math.floor((cx-GRID_MARGIN_X)/GRID_CELL_W)));
+    const row=Math.min(GRID_ROWS-1,Math.max(0,Math.floor((cy-GRID_MARGIN_Y)/GRID_CELL_H)));
+    const tileX=GRID_MARGIN_X+col*GRID_CELL_W, tileY=GRID_MARGIN_Y+row*GRID_CELL_H;
+    ctx.save();
+    ctx.fillStyle='rgba(57,255,20,0.35)';
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='rgba(57,255,20,0.9)';
+    ctx.lineWidth=2;
+    ctx.strokeRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.strokeStyle='#22c700';
+    ctx.lineWidth=4;
+    ctx.lineCap='round';
+    const armLen=10;
+    ctx.beginPath();
+    ctx.moveTo(-armLen,-armLen); ctx.lineTo(armLen,armLen);
+    ctx.moveTo(armLen,-armLen); ctx.lineTo(-armLen,armLen);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // airstrike tile-picker: same private-cursor mechanic as teleport, red-themed
+  // and modeled on the homing icon (ring + center dot + crosshair ticks), just big
+  if(me && me.alive && me.airstrikeTargeting){
+    const cx=me.airstrikeCursorX, cy=me.airstrikeCursorY;
+    const col=Math.min(GRID_COLS-1,Math.max(0,Math.floor((cx-GRID_MARGIN_X)/GRID_CELL_W)));
+    const row=Math.min(GRID_ROWS-1,Math.max(0,Math.floor((cy-GRID_MARGIN_Y)/GRID_CELL_H)));
+    const tileX=GRID_MARGIN_X+col*GRID_CELL_W, tileY=GRID_MARGIN_Y+row*GRID_CELL_H;
+    ctx.save();
+    ctx.fillStyle='rgba(230,30,30,0.35)';
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='rgba(230,30,30,0.9)';
+    ctx.lineWidth=2;
+    ctx.strokeRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.strokeStyle='#e60000';
+    ctx.fillStyle='#e60000';
+    ctx.lineWidth=4;
+    ctx.beginPath(); ctx.arc(0,0,22,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(0,0,4,0,Math.PI*2); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(0,-34); ctx.lineTo(0,-26);
+    ctx.moveTo(0,34); ctx.lineTo(0,26);
+    ctx.moveTo(-34,0); ctx.lineTo(-26,0);
+    ctx.moveTo(34,0); ctx.lineTo(26,0);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const clockNow=simClock();
+  for(const b of state.bullets||[]){
+    if(b.type==='homing'){
+      const age=b.spawnTime!=null?(clockNow-b.spawnTime):0;
+      const frac=b.maxLife?Math.min(1,age/b.maxLife):0;
+      ctx.save();
+      ctx.translate(b.x,b.y); ctx.rotate(b.a);
+      ctx.fillStyle=lerpColor(b.color||'#111','#ff0000',frac);
+      ctx.beginPath(); ctx.moveTo(8,0); ctx.lineTo(-6,5); ctx.lineTo(-6,-5); ctx.closePath(); ctx.fill();
+      ctx.restore();
+    } else if(b.type==='rc'){
+      const age=b.spawnTime!=null?(clockNow-b.spawnTime):0;
+      const frac=b.maxLife?Math.min(1,age/b.maxLife):0;
+      ctx.save();
+      ctx.translate(b.x,b.y); ctx.rotate(b.a);
+      ctx.fillStyle=lerpColor('#2ecc71','#ff0000',frac);
+      ctx.strokeStyle=lerpColor('#145a2a','#7a0000',frac); ctx.lineWidth=1;
+      ctx.fillRect(-7,-4,14,8);
+      ctx.strokeRect(-7,-4,14,8);
+      ctx.restore();
+    } else if(b.type==='abomb'){
+      const age=b.spawnTime!=null?(clockNow-b.spawnTime):0;
+      const fuse=b.fuseTime||3000;
+      const frac=Math.min(1,age/fuse); // black -> red as the fuse burns down
+      const pulse=Math.sin(age/120); // fast "about to blow" throb
+      const sizeMul=1+0.1*pulse; // +/-10% size
+      const alphaMul=0.55+0.45*((pulse+1)/2); // fades in and out, never fully gone
+      ctx.save();
+      ctx.globalAlpha=alphaMul;
+      ctx.fillStyle=lerpColor('#111111','#ff0000',frac);
+      ctx.beginPath(); ctx.arc(b.x,b.y,8*sizeMul,0,Math.PI*2); ctx.fill(); // 200% of the regular 4px bullet
+      ctx.restore();
+    } else if(b.type==='superbullet'){
+      // smooth continuous fade cycling black -> yellow -> blue -> black - same size as a regular bullet
+      const SB_STOPS=['#111111','#ffe600','#2b6fff','#111111'];
+      const SB_SEG_MS=400; // time to fade between each pair of stops - raise to slow it down further
+      const cycleLen=SB_SEG_MS*(SB_STOPS.length-1);
+      const tInCycle=clockNow%cycleLen;
+      const segIdx=Math.floor(tInCycle/SB_SEG_MS);
+      const segT=(tInCycle%SB_SEG_MS)/SB_SEG_MS;
+      ctx.fillStyle=lerpColor(SB_STOPS[segIdx],SB_STOPS[segIdx+1],segT);
+      ctx.beginPath(); ctx.arc(b.x,b.y,4,0,Math.PI*2); ctx.fill();
+    } else {
+      const bounces=b.bounces||0, maxBounces=b.maxBounces||20;
+      const frac=Math.min(1,bounces/maxBounces);
+      const r=b.type==='mg'?2.4:4; // mg bullets are 40% smaller
+      ctx.fillStyle=lerpColor('#111111','#ff0000',frac);
+      ctx.beginPath(); ctx.arc(b.x,b.y,r,0,Math.PI*2); ctx.fill();
+    }
+  }
+
+  // a-bomb shrapnel: deadly debris triangles, server-authoritative positions
+  for(const s of state.shrapnel||[]){
+    ctx.save();
+    ctx.translate(s.x,s.y);
+    ctx.rotate(s.angle);
+    ctx.fillStyle='#2b2b2b';
+    ctx.strokeStyle='#000';
+    ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(6,0); ctx.lineTo(-4,3.5); ctx.lineTo(-4,-3.5);
+    ctx.closePath();
+    ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  const now=performance.now();
+  for(const [id,p] of Object.entries(state.players||{})){
+    if(!p.alive) continue;
+    if(p.ghosted && id!=myControlledId()) continue; // invisible to everyone except its own pilot
+    ctx.save();
+    if(p.ghosted) ctx.globalAlpha=0.5; // the pilot still sees their own tank, just translucent
+    if(p.isClone) ctx.globalAlpha=(ctx.globalAlpha||1)*0.55; // clones read as copies
+    if(p.glow){
+      ctx.save();
+      ctx.globalAlpha=0.35;
+      ctx.fillStyle=p.glow;
+      ctx.beginPath(); ctx.arc(p.x,p.y,22,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    if(p.charging){
+      const pulse=0.4+0.4*Math.sin(now/90);
+      ctx.save();
+      ctx.globalAlpha=pulse; ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+      ctx.beginPath(); ctx.arc(p.x,p.y,20,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+    }
+    if(p.piloting){
+      // tank body dimmed/frozen while its RC rocket is out
+      ctx.save();
+      ctx.globalAlpha=0.5; ctx.strokeStyle='#a78bfa'; ctx.lineWidth=2;
+      ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(p.x,p.y,19,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+    }
+    ctx.save();
+    ctx.translate(p.x,p.y);
+    ctx.rotate(p.a);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(-15,-11,30,22);
+    ctx.fillStyle='#222';
+    ctx.fillRect(0,-4,22,8);
+
+    // 2-frame texture overlay, tinted through by 'multiply' so the tank color still shows
+    const animate = !!p.moving;
+    const frameIdx = animate ? (Math.floor(now/200)%2) : 0; // stationary tanks freeze on frame 0
+    const img=tankFrames[frameIdx];
+    if(framesReady[frameIdx]){
+      ctx.save();
+      ctx.globalCompositeOperation='source-over';     //multiply
+      // no fade - fully opaque overlay, tank color still shows through the
+      // multiply blend wherever the source texture isn't pure black
+      ctx.rotate(-Math.PI/2); // align image's shaft with tank's forward (+x) axis
+      // Tank body+cannon silhouette spans local x: -15 (rear) .. +22 (muzzle),
+      // a 37px length, and y: -11 .. +11 (22px tall). The source image is
+      // portrait at a 2436:4000 ratio, so at length 37 its width comes out
+      // to ~22.5 - almost exactly the tank's height, hence the near-perfect
+      // fit once sized/positioned to that exact box.
+      const targetH=37, targetW=targetH*(img.width/img.height);
+      ctx.drawImage(img, -targetW/2, -15, targetW, targetH);
+      ctx.restore();
+    }
+    ctx.restore();
+
+    if(p.frozen){
+      // light blue translucent circle, same size as the tank, stays on top
+      ctx.save();
+      ctx.globalAlpha=0.45;
+      ctx.fillStyle='#bde4ff';
+      ctx.beginPath(); ctx.arc(p.x,p.y,15,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    if(p.sliding){
+      // same idea as freeze's circle, but black
+      ctx.save();
+      ctx.globalAlpha=0.45;
+      ctx.fillStyle='#000';
+      ctx.beginPath(); ctx.arc(p.x,p.y,15,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+    if(p.cannonCapped){
+      // red translucent circle - regular bullets disabled
+      ctx.save();
+      ctx.globalAlpha=0.45;
+      ctx.fillStyle='#e01010';
+      ctx.beginPath(); ctx.arc(p.x,p.y,15,0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.fillStyle='#111'; ctx.font='11px Arial'; ctx.textAlign='center';
+    const label=p.name?p.name:('P'+id);
+    ctx.fillText(label + (id==myControlledId()?' (you)':''), p.x, p.y-26);
+
+    const SHOTS_LEFT_MAP={powerbeam:'powerBeamShots', mg:'mgShots', superbullet:'superBulletShots', blackhole:'blackHoleShots', flamethrower:'flameFuel', wall:'wallShots'};
+    const shotsField=SHOTS_LEFT_MAP[p.powerup];
+    if(shotsField && p[shotsField]>0){
+      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial';
+      ctx.fillText(String(p[shotsField]), p.x, p.y-40);
+    } else if(p.hacking && p.hackSecondsLeft>0){
+      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial';
+      ctx.fillText(String(p.hackSecondsLeft), p.x, p.y-40);
+    }
+
+    if(p.alive){
+      const hp=p.hp!=null?p.hp:100;
+      const barW=28, barH=4, barY=p.y-19;
+      const frac=Math.max(0,Math.min(1,hp/100));
+      ctx.fillStyle='rgba(0,0,0,0.35)';
+      ctx.fillRect(p.x-barW/2-1, barY-1, barW+2, barH+2);
+      ctx.fillStyle='#333';
+      ctx.fillRect(p.x-barW/2, barY, barW, barH);
+      ctx.fillStyle = hp<30 ? '#e63946' : hp<50 ? '#fb8500' : '#22c55e';
+      ctx.fillRect(p.x-barW/2, barY, barW*frac, barH);
+    }
+    ctx.restore();
+  }
+
+  // explosions: ~1s fireball with expanding rings + flying colored particles
+  explosions=explosions.filter(ex=>now-ex.start<1000);
+  for(const ex of explosions){
+    const t=now-ex.start;
+    const prog=Math.min(t/1000,1);
+
+    // bright core flash - quick, near the start only
+    if(t<180){
+      const flashProg=t/180;
+      ctx.save();
+      ctx.globalAlpha=1-flashProg;
+      ctx.fillStyle='#fff8e1';
+      ctx.beginPath(); ctx.arc(ex.x,ex.y,20*(1-flashProg*0.4),0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+
+    // layered expanding orange/red rings (the "explosion with circles")
+    ctx.save();
+    ctx.globalAlpha=(1-prog)*0.55;
+    ctx.fillStyle='#fb8500';
+    ctx.beginPath(); ctx.arc(ex.x,ex.y,8+prog*38,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=(1-prog)*0.65;
+    ctx.fillStyle='#e63946';
+    ctx.beginPath(); ctx.arc(ex.x,ex.y,5+prog*26,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=Math.max(0,(1-prog*1.6));
+    ctx.fillStyle='#ffd60a';
+    ctx.beginPath(); ctx.arc(ex.x,ex.y,3+prog*14,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // flying yellow/orange/red particles
+    for(const p of ex.particles){
+      const pt=t-p.delay;
+      if(pt<0||pt>p.life) continue;
+      const pProg=pt/p.life;
+      const d=p.dist+p.speed*(pt/1000);
+      const px=ex.x+Math.cos(p.ang)*d;
+      const py=ex.y+Math.sin(p.ang)*d;
+      ctx.save();
+      ctx.globalAlpha=Math.max(0,1-pProg);
+      ctx.fillStyle=p.color;
+      ctx.beginPath();
+      ctx.arc(px,py,Math.max(0.5,p.size*(1-pProg*0.6)),0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // muzzle smoke puffs (0.5s, tiny gray particles from the cannon end)
+  muzzleSmokes=muzzleSmokes.filter(sm=>now-sm.start<500);
+  for(const sm of muzzleSmokes){
+    const t=now-sm.start;
+    for(const p of sm.particles){
+      const pt=t-p.delay;
+      if(pt<0||pt>p.life) continue;
+      const pProg=pt/p.life;
+      const d=p.dist+p.speed*(pt/1000);
+      const px=sm.x+Math.cos(p.ang)*d;
+      const py=sm.y+Math.sin(p.ang)*d;
+      const size=p.size+(p.growTo-p.size)*pProg;
+      ctx.save();
+      ctx.globalAlpha=0.5*(1-pProg);
+      ctx.fillStyle='#777';
+      ctx.beginPath();
+      ctx.arc(px,py,size,0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // a-bomb detonation fireball (~1s, monochrome flash + rings + debris puffs)
+  abombBlasts=abombBlasts.filter(ex=>now-ex.start<1000);
+  for(const ex of abombBlasts){
+    const t=now-ex.start;
+    const prog=Math.min(t/1000,1);
+
+    if(t<180){
+      const flashProg=t/180;
+      ctx.save();
+      ctx.globalAlpha=1-flashProg;
+      ctx.fillStyle='#eeeeee';
+      ctx.beginPath(); ctx.arc(ex.x,ex.y,20*(1-flashProg*0.4),0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha=(1-prog)*0.5;
+    ctx.fillStyle='#555555';
+    ctx.beginPath(); ctx.arc(ex.x,ex.y,8+prog*40,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=(1-prog)*0.6;
+    ctx.fillStyle='#222222';
+    ctx.beginPath(); ctx.arc(ex.x,ex.y,5+prog*26,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    for(const p of ex.particles){
+      const pt=t-p.delay;
+      if(pt<0||pt>p.life) continue;
+      const pProg=pt/p.life;
+      const d=p.dist+p.speed*(pt/1000);
+      const px=ex.x+Math.cos(p.ang)*d;
+      const py=ex.y+Math.sin(p.ang)*d;
+      ctx.save();
+      ctx.globalAlpha=Math.max(0,1-pProg);
+      ctx.fillStyle=p.color;
+      ctx.beginPath();
+      ctx.arc(px,py,Math.max(0.5,p.size*(1-pProg*0.6)),0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // "clean" powerup: growing translucent red wave from the activator's tank,
+  // fast ease-out over 1s until it covers the whole screen. Visible to everyone.
+  cleanWaves=cleanWaves.filter(cw=>now-cw.start<1000);
+  for(const cw of cleanWaves){
+    const t=now-cw.start;
+    const prog=Math.min(t/1000,1);
+    const eased=1-Math.pow(1-prog,3); // grows fast at first, settles right as it finishes
+    const maxR=Math.hypot(W,H)+40; // big enough to always cover the canvas from any origin
+    const r=maxR*eased;
+    const alpha=0.5*(1-prog*0.25);
+    ctx.save();
+    ctx.beginPath();
+    ctx.arc(cw.x,cw.y,r,0,Math.PI*2);
+    ctx.fillStyle=`rgba(200,20,20,${alpha.toFixed(3)})`;
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // black hole: the fired-on tile flashes very dark green then fades out
+  // over 0.3s. Visible to everyone.
+  blackHoleFades=blackHoleFades.filter(f=>now-f.start<300);
+  for(const f of blackHoleFades){
+    const t=now-f.start;
+    const prog=Math.min(t/300,1);
+    const tileX=GRID_MARGIN_X+f.col*GRID_CELL_W, tileY=GRID_MARGIN_Y+f.row*GRID_CELL_H;
+    ctx.save();
+    ctx.globalAlpha=(1-prog)*0.85;
+    ctx.fillStyle='#0b3d0b';
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.restore();
+  }
+
+  // airstrike: big orange explosion, starts the instant the 1s fade ends,
+  // lasts 0.5s. Visible to everyone.
+  const airstrikeClockNow=simClock();
+  airstrikeExplosions=airstrikeExplosions.filter(ex=>airstrikeClockNow-ex.confirmTime<1550);
+  for(const ex of airstrikeExplosions){
+    const age=airstrikeClockNow-ex.confirmTime;
+    const t=age-1000; // ms into the 0.5s explosion window
+    if(t<0||t>500) continue;
+    const prog=t/500;
+
+    if(t<120){
+      const flashProg=t/120;
+      ctx.save();
+      ctx.globalAlpha=1-flashProg;
+      ctx.fillStyle='#fff3d6';
+      ctx.beginPath(); ctx.arc(ex.cx,ex.cy,26*(1-flashProg*0.4),0,Math.PI*2); ctx.fill();
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.globalAlpha=(1-prog)*0.55;
+    ctx.fillStyle='#ff8c00';
+    ctx.beginPath(); ctx.arc(ex.cx,ex.cy,12+prog*55,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=(1-prog)*0.7;
+    ctx.fillStyle='#ff4500';
+    ctx.beginPath(); ctx.arc(ex.cx,ex.cy,7+prog*36,0,Math.PI*2); ctx.fill();
+    ctx.globalAlpha=Math.max(0,1-prog*1.5);
+    ctx.fillStyle='#ffd580';
+    ctx.beginPath(); ctx.arc(ex.cx,ex.cy,4+prog*18,0,Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    for(const p of ex.particles){
+      const pt=t-p.delay;
+      if(pt<0||pt>p.life) continue;
+      const pProg=pt/p.life;
+      const d=p.dist+p.speed*(pt/1000);
+      const px=ex.cx+Math.cos(p.ang)*d;
+      const py=ex.cy+Math.sin(p.ang)*d;
+      ctx.save();
+      ctx.globalAlpha=Math.max(0,1-pProg);
+      ctx.fillStyle=p.color;
+      ctx.beginPath();
+      ctx.arc(px,py,Math.max(0.5,p.size*(1-pProg*0.6)),0,Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+  }
+
+  // darkness: everything is blacked out except a circle of light that follows
+  // your own tank. The player who fired it keeps near-full visibility.
+  if(state.darkness){
+    const meDark=state.players[myControlledId()]||null;
+    const isOwner=state.darkness.ownerId==myId;
+    const alpha=isOwner?0.18:0.97;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0,0,W,H);
+    if(meDark && meDark.alive){
+      ctx.moveTo(meDark.x+DARKNESS_LIGHT_RADIUS,meDark.y);
+      ctx.arc(meDark.x,meDark.y,DARKNESS_LIGHT_RADIUS,0,Math.PI*2,true);
+    }
+    ctx.fillStyle=`rgba(0,0,0,${alpha})`;
+    ctx.fill('evenodd');
+    ctx.restore();
+    if(meDark && meDark.alive){
+      ctx.save();
+      ctx.strokeStyle='rgba(255,240,180,0.25)';
+      ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(meDark.x,meDark.y,DARKNESS_LIGHT_RADIUS,0,Math.PI*2); ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // time stop: cool pale tint over the whole arena plus a countdown so
+  // everyone understands why the world just froze
+  if(state.timeStop){
+    ctx.save();
+    ctx.fillStyle='rgba(190,215,255,0.16)';
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign='center';
+    ctx.font='bold 26px Arial';
+    ctx.fillStyle='rgba(30,50,90,0.85)';
+    ctx.fillText('TIME STOPPED  '+Math.ceil(state.timeStop.secondsLeft),W/2,34);
+    ctx.restore();
+  }
+
+  // overlays
+  const phase=state.gamePhase;
+  if(phase==='lobby'){
+    ctx.fillStyle='rgba(255,255,255,.85)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#111'; ctx.textAlign='center';
+    ctx.font='bold 32px Arial';
+    ctx.fillText('Tank Trouble LAN', W/2, H/2-90);
+    ctx.font='18px Arial';
+    const players=Object.entries(state.players||{});
+    if(players.length===0){
+      ctx.fillText('Waiting for players to connect...', W/2, H/2-50);
+    } else {
+      ctx.fillText('Pick a color and name above, then press R when ready', W/2, H/2-50);
+      const readyText=players.map(([id,p])=>`${p.name||('P'+id)}:${p.ready?'ready':'not ready'}`).join('   ');
+      ctx.font='14px Arial';
+      ctx.fillText(readyText, W/2, H/2-24);
+    }
+  } else if(phase==='round' && state.lonely){
+    ctx.fillStyle='#111'; ctx.textAlign='center'; ctx.font='bold 20px Arial';
+    ctx.fillText(`Last one standing! Survive ${state.lonely.secondsLeft.toFixed(1)}s for the point!`, W/2, 30);
+  } else if(phase==='roundend'){
+    ctx.fillStyle='rgba(255,255,255,.6)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#111'; ctx.textAlign='center'; ctx.font='bold 26px Arial';
+    const info=state.roundEndInfo;
+    if(info && info.winnerId!=null){
+      const wp=state.players[info.winnerId];
+      ctx.fillText(`${wp&&wp.name?wp.name:('Player P'+info.winnerId)} survives the round! +1 point`, W/2, H/2);
+    } else {
+      ctx.fillText(`No one survives — no point this round`, W/2, H/2);
+    }
+    ctx.font='16px Arial';
+    ctx.fillText('Next round starting...', W/2, H/2+32);
+  } else if(phase==='gameover'){
+    ctx.fillStyle='rgba(0,0,0,.7)'; ctx.fillRect(0,0,W,H);
+    const w=state.gameWinner;
+    ctx.fillStyle=w?w.color:'#fff';
+    ctx.textAlign='center'; ctx.font='bold 36px Arial';
+    ctx.fillText(w ? `yeey tank colored ${w.colorName} wins!!` : 'Game over!', W/2, H/2);
+    ctx.fillStyle='#fff'; ctx.font='16px Arial';
+    ctx.fillText('Click "Play Again" above to reset the game', W/2, H/2+38);
+  }
+}
+
+connect();
+render();
+</script></body></html>
