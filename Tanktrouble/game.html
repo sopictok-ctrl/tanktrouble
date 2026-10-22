@@ -25,6 +25,13 @@ canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max
   background:#222;color:#eee;text-transform:uppercase}
 #nameInput.missing{border-color:#e63946;box-shadow:0 0 0 1px #e63946}
 #lobbyHint{font-size:12px;color:#aaa;text-align:center;max-width:240px}
+#readyList{display:flex;flex-direction:column;gap:4px;width:100%}
+.readyRow{display:flex;align-items:center;gap:8px;padding:4px 8px;border-radius:5px;background:rgba(0,0,0,.35);font-size:13px}
+.readyDot{width:12px;height:12px;border-radius:3px;flex:none}
+.readyName{flex:1;font-weight:bold}
+.readyState{font-size:11px;font-weight:bold;color:#ff9b9b}
+.readyRow.isReady{box-shadow:inset 0 0 0 1px #7cff8a}
+.readyRow.isReady .readyState{color:#7cff8a}
 #canvasWrap{position:relative}
 #pauseOverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
   background:rgba(0,0,0,.45);color:#fff;font-size:26px;font-weight:bold;font-family:Arial,sans-serif;z-index:4}
@@ -38,17 +45,21 @@ canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max
   <div id="colorRow"></div>
   <input id="nameInput" maxlength="6" placeholder="NAME">
   <div id="lobbyHint">Type a name (required), press Enter to confirm, pick a free color, then press R when ready</div>
+  <div id="readyList"></div>
 </div>
 <div id="pauseOverlay">PAUSED</div>
 </div>
 </div>
-<div id="help">Move: WASD / Arrows &nbsp; Fire/Use: Space &nbsp; R = ready/start &nbsp; P = host pause &nbsp; Grab boxes on the map for Nitro (yellow), Laser (blue), Homing Missile (red), Shield (green), RC Rocket (purple), A-Bomb (brown), Power Beam (pink), Machine Gun (teal), Health Pack (green +), Teleport (light blue), Super Bullet (indigo), Clean (dark red), Airstrike (black), Ghost (slate gray), Bouncing Laser (amber), Hacking (neon green), Freeze (light blue), Black Hole (white), Flamethrower (neon red), Wall (stone gray), Slide (dark oily brown), Cannon Cap (red), Clone (cyan), Shock (yellow), Darkness (dark brown), Time Stop (amber)</div>
+<div id="help">Move: WASD / Arrows &nbsp; Fire/Use: Space &nbsp; R = ready/start &nbsp; P = host pause &nbsp; Grab boxes on the map for Nitro (yellow), Laser (blue), Homing Missile (red), Shield (green), RC Rocket (purple), A-Bomb (brown), Power Beam (pink), Machine Gun (teal), Health Pack (green +), Teleport (light blue), Super Bullet (indigo), Clean (dark red), Airstrike (black), Ghost (slate gray), Bouncing Laser (amber), Hacking (neon green), Freeze (light blue), Black Hole (white), Flamethrower (neon red), Wall (stone gray), Slide (dark oily brown), Cannon Cap (red), Clone (cyan), Shock (yellow), Darkness (dark brown), Time Stop (amber), Swap (olive), Fast Bullet (pink), Super Health (gold +), Drone (light red), Safetile (light green), Joker (white/gold), Magnet (white), Antimagnet (dark blue), Slot Machine (red, ???), Shotgun (white, 3 dots), Star Bullet (white, 9 dots), Time Shield (light blue, clock), Health Orb (green +)</div>
 <script>
 const canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
 const statusEl=document.getElementById('status'),playersEl=document.getElementById('players'),scoresEl=document.getElementById('scores');
 const resetBtn=document.getElementById('resetBtn');
 const lobbyPanel=document.getElementById('lobbyPanel'),colorRow=document.getElementById('colorRow'),nameInput=document.getElementById('nameInput');
 const pauseOverlay=document.getElementById('pauseOverlay');
+const SHOW_HELP=false; // set to true to bring back the lobby help text listing every powerup
+const helpEl=document.getElementById('help'),readyListEl=document.getElementById('readyList');
+let debugMode=false;
 const W=canvas.width,H=canvas.height;
 const GRID_COLS=9, GRID_ROWS=6, GRID_MARGIN_X=50, GRID_MARGIN_Y=40;
 const DARKNESS_LIGHT_RADIUS=110; // size of the visible circle during darkness
@@ -87,8 +98,8 @@ const COLOR_NAMES={'#e63946':'Red','#3a86ff':'Blue','#2ecc71':'Green','#f4a261':
 
 // ---- tank texture frames ----
 const tankFrames=[new Image(),new Image()];
-tankFrames[0].src='/assets/tank1.png';
-tankFrames[1].src='/assets/tank2.png';
+tankFrames[0].src='assets/tank1.png';
+tankFrames[1].src='assets/tank2.png';
 let framesReady=[false,false];
 tankFrames[0].onload=()=>framesReady[0]=true;
 tankFrames[1].onload=()=>framesReady[1]=true;
@@ -109,6 +120,7 @@ addEventListener('keydown',e=>{
     }
   }
   if(e.code==='KeyP') send({type:'pause'});
+  if((e.code==='Digit9'||e.code==='Numpad9') && state.gamePhase==='round' && state.hostId===myId) send({type:'selfdestruct'}); // host self-destruct
 });
 addEventListener('keyup',e=>{ if(document.activeElement!==nameInput) keys[e.code]=false; });
 resetBtn.onclick=()=>send({type:'reset'});
@@ -136,12 +148,34 @@ function buildColorPicker(colors){
   colorsBuilt=true;
 }
 
+// No reachable server (page opened as a file, or served by something that
+// isn't server.js) -> load server.js into this page and play offline in
+// debug mode. If the real server answers, everything runs normally.
 function connect(){
-  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
-  ws.onopen=()=>{statusEl.textContent='Connected';};
-  ws.onclose=()=>{statusEl.textContent='Disconnected — refresh';};
-  ws.onerror=()=>statusEl.textContent='Connection error';
-  ws.onmessage=e=>{
+  if(location.protocol==='file:'){ startDebugMode(); return; }
+  let opened=false;
+  try{
+    ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host);
+  }catch(err){ startDebugMode(); return; }
+  ws.onopen=()=>{opened=true; statusEl.textContent='Connected';};
+  ws.onclose=()=>{ if(!opened){ startDebugMode(); return; } statusEl.textContent='Disconnected — refresh'; };
+  ws.onerror=()=>{ if(opened) statusEl.textContent='Connection error'; };
+  ws.onmessage=handleMessage;
+}
+function startDebugMode(){
+  if(debugMode) return;
+  debugMode=true;
+  statusEl.textContent='No server - starting debug mode...';
+  const s=document.createElement('script');
+  s.src='server.js';
+  s.onload=()=>{
+    if(!window.TankDebugServer){ statusEl.textContent='Debug mode failed to start'; return; }
+    ws=window.TankDebugServer.start(handleMessage);
+  };
+  s.onerror=()=>{ statusEl.textContent='No server, and server.js not found next to game.html'; };
+  document.head.appendChild(s);
+}
+function handleMessage(e){
     const m=JSON.parse(e.data);
     if(m.type==='welcome') myId=m.id;
     if(m.type==='full') statusEl.textContent='Server full (max 4 players)';
@@ -173,7 +207,7 @@ function connect(){
       for(const c of (m.state.cleanEvents||[])){
         if(!seenCleanEventIds.has(c.id)){
           seenCleanEventIds.add(c.id);
-          cleanWaves.push({x:c.x,y:c.y,start:performance.now()});
+          cleanWaves.push({x:c.x,y:c.y,start:performance.now(),kind:c.kind||'clean'});
         }
       }
 
@@ -224,8 +258,30 @@ function connect(){
       statusEl.textContent = state.paused ? 'Paused' : state.gamePhase==='gameover' ? 'Game over' :
         state.gamePhase==='lobby' ? 'Waiting to start' : `Round ${state.roundNumber}`;
       resetBtn.style.display = state.gamePhase==='gameover' ? 'inline-block' : 'none';
+      const MAP_NAMES={empty:'Empty Lands',horizontal:'Horizontal Lines',maze:'Maze',blocks:'Solid Blocks',mixed:'Mixed Walls',islands:'Islands',waterwalls:'Water & Walls',lakes:'Lakes'};
+      if(state.mapType && MAP_NAMES[state.mapType] && (state.gamePhase==='round'||state.gamePhase==='roundend')){
+        const sm=document.createElement('small'); sm.style.cssText='font-size:11px;opacity:.7;margin-left:8px';
+        sm.textContent='Map: '+MAP_NAMES[state.mapType]; statusEl.appendChild(sm);
+      }
+      if(debugMode) statusEl.textContent='DEBUG MODE (no server) · '+statusEl.textContent;
+      helpEl.style.display = (SHOW_HELP && state.gamePhase==='lobby') ? '' : 'none'; // help only in the lobby (and only if SHOW_HELP)
+
+      // lobby: list every player and whether they've pressed ready yet
+      if(state.gamePhase==='lobby'){
+        readyListEl.innerHTML='';
+        for(const [id,p] of realEntries){
+          const row=document.createElement('div');
+          row.className='readyRow'+(p.ready?' isReady':'');
+          const dot=document.createElement('span'); dot.className='readyDot'; dot.style.background=p.color;
+          const nm=document.createElement('span'); nm.className='readyName';
+          nm.textContent=(p.name||('P'+id))+(id==myId?' (you)':'');
+          const st=document.createElement('span'); st.className='readyState';
+          st.textContent=p.ready?'\u2713 READY':'not ready';
+          row.append(dot,nm,st);
+          readyListEl.appendChild(row);
+        }
+      }
     }
-  }
 }
 function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
 
@@ -374,24 +430,37 @@ const POWERUP_BOX_COLORS = {
   blackhole: '#ffffff',   // white
   flamethrower: '#ff073a', // neon red
   wall: '#ffffff',         // white
+  water: '#5aa9f0',        // light mid blue
   slide: '#d1d5db',        // light gray
   cannoncap: '#ffffff',    // white
   clone: '#bfe3f5',        // light blue
   shock: '#fdf3a7',        // light yellow
   darkness: '#4a3218',     // dark brown
-  timestop: '#c8a26b'      // light brown
+  timestop: '#c8a26b',     // light brown
+  swap: '#fde047',         // yellow
+  fastbullet: '#ffc0cb',   // light pink
+  drone: '#ff9e9e',
+  safetile: '#bbf7d0',     // light green
+  joker: '#ffffff',        // white
+  magnet: '#ffffff',       // white
+  antimagnet: '#0b1437',   // very dark blue
+  slotmachine: '#ff0000',  // bright red
+  shotgun: '#ffffff',      // white
+  starbullet: '#ffffff',   // white
+  timeshield: '#a5d8ff',   // light blue
+  healthorb: '#22c55e'     // green
 };
 function drawPowerupIcon(pu){
   const s=14;
   ctx.save();
   ctx.translate(pu.x,pu.y);
-  ctx.scale(1.25,1.25); // 25% bigger overall
+  const sc=1.25*(pu.scale||1); ctx.scale(sc,sc); // 25% bigger overall (pu.scale lets the joker picker enlarge icons)
   ctx.fillStyle=POWERUP_BOX_COLORS[pu.type]||'#222';
   ctx.strokeStyle='#000';
   ctx.lineWidth=1;
   ctx.fillRect(-s/2,-s/2,s,s);
   ctx.strokeRect(-s/2,-s/2,s,s);
-  const iconColor=(pu.type==='freeze'||pu.type==='blackhole'||pu.type==='flamethrower'||pu.type==='slide'||pu.type==='clone'||pu.type==='shock'||pu.type==='timestop')?'#000':'#fff'; // these keep their glyph black
+  const iconColor=(pu.type==='freeze'||pu.type==='blackhole'||pu.type==='flamethrower'||pu.type==='slide'||pu.type==='clone'||pu.type==='shock'||pu.type==='timestop'||pu.type==='swap'||pu.type==='fastbullet'||pu.type==='drone'||pu.type==='shotgun'||pu.type==='starbullet')?'#000':'#fff'; // these keep their glyph black
   ctx.fillStyle=iconColor;
   ctx.strokeStyle=iconColor;
   if(pu.type==='nitro'){
@@ -449,6 +518,41 @@ function drawPowerupIcon(pu){
     ctx.beginPath(); ctx.arc(-5,0,1.6,0,Math.PI*2); ctx.fill();
     ctx.beginPath(); ctx.arc(0,0,1.6,0,Math.PI*2); ctx.fill();
     ctx.beginPath(); ctx.arc(5,0,1.6,0,Math.PI*2); ctx.fill();
+  } else if(pu.type==='timeshield'){
+    // dark blue shield with thin black outline, minimal white clock inside
+    ctx.save();
+    ctx.scale(1.15,1.15);
+    ctx.beginPath();
+    ctx.moveTo(0,-5); ctx.lineTo(4,-3); ctx.lineTo(4,1);
+    ctx.quadraticCurveTo(4,4.5,0,5.5);
+    ctx.quadraticCurveTo(-4,4.5,-4,1);
+    ctx.lineTo(-4,-3);
+    ctx.closePath();
+    ctx.fillStyle='#1e3a8a'; ctx.fill();
+    ctx.strokeStyle='#000'; ctx.lineWidth=0.6; ctx.stroke();
+    ctx.strokeStyle='#fff'; ctx.lineWidth=0.7; ctx.lineCap='round';
+    ctx.beginPath(); ctx.arc(0,0.3,2.4,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,0.3); ctx.lineTo(0,-1.3); ctx.moveTo(0,0.3); ctx.lineTo(1.2,0.3); ctx.stroke();
+    ctx.restore();
+  } else if(pu.type==='healthorb'){
+    // dark green circle with a neon green plus
+    ctx.beginPath(); ctx.arc(0,0,5.6,0,Math.PI*2);
+    ctx.fillStyle='#14532d'; ctx.fill();
+    ctx.fillStyle='#39ff14';
+    ctx.fillRect(-0.9,-3.4,1.8,6.8);
+    ctx.fillRect(-3.4,-0.9,6.8,1.8);
+  } else if(pu.type==='starbullet'){
+    // 9 small circles: one in the middle, 8 evenly spaced around it
+    ctx.beginPath(); ctx.arc(0,0,1.3,0,Math.PI*2); ctx.fill();
+    for(let i=0;i<8;i++){
+      const ang=i*Math.PI/4;
+      ctx.beginPath(); ctx.arc(Math.cos(ang)*4.6,Math.sin(ang)*4.6,1.1,0,Math.PI*2); ctx.fill();
+    }
+  } else if(pu.type==='shotgun'){
+    // 3 bullets in a spread: one left-middle, two right (top and bottom)
+    ctx.beginPath(); ctx.arc(-4,0,1.6,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(3.5,-4,1.6,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(3.5,4,1.6,0,Math.PI*2); ctx.fill();
   } else if(pu.type==='health'){
     // green rectangle with a white plus sign
     ctx.fillStyle='#2ecc71';
@@ -456,6 +560,32 @@ function drawPowerupIcon(pu){
     ctx.fillStyle='#fff';
     ctx.fillRect(-1.2,-4.5,2.4,9);
     ctx.fillRect(-4.5,-1.2,9,2.4);
+  } else if(pu.type==='superhealth'){
+    // same as health, but a dark gold background behind the white plus
+    ctx.fillStyle='#b8860b';
+    ctx.fillRect(-6,-6,12,12);
+    ctx.fillStyle='#fff';
+    ctx.fillRect(-1.2,-4.5,2.4,9);
+    ctx.fillRect(-4.5,-1.2,9,2.4);
+  } else if(pu.type==='fastbullet'){
+    // >>> three black chevrons
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.4; ctx.lineCap='round'; ctx.lineJoin='round';
+    for(const x of [-4,0,4]){
+      ctx.beginPath();
+      ctx.moveTo(x-1.6,-3.6); ctx.lineTo(x+1.6,0); ctx.lineTo(x-1.6,3.6);
+      ctx.stroke();
+    }
+  } else if(pu.type==='drone'){
+    // X with circles on the 4 ends and a small rectangle in the middle
+    ctx.strokeStyle='#000'; ctx.fillStyle='#000'; ctx.lineWidth=1.3;
+    ctx.beginPath();
+    ctx.moveTo(-4,-4); ctx.lineTo(4,4);
+    ctx.moveTo(4,-4); ctx.lineTo(-4,4);
+    ctx.stroke();
+    for(const [cx,cy] of [[-4,-4],[4,-4],[-4,4],[4,4]]){
+      ctx.beginPath(); ctx.arc(cx,cy,1.9,0,Math.PI*2); ctx.fill();
+    }
+    ctx.fillRect(-1.8,-1.4,3.6,2.8);
   } else if(pu.type==='teleport'){
     // simple white spiral
     ctx.strokeStyle='#fff';
@@ -574,6 +704,12 @@ function drawPowerupIcon(pu){
     ctx.quadraticCurveTo(-5,-1,0,-6);
     ctx.closePath();
     ctx.fill();
+  } else if(pu.type==='water'){
+    // white sine wave
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1.8; ctx.lineCap='round';
+    ctx.beginPath();
+    for(let x=-6;x<=6;x+=1){ const y=-Math.sin((x+6)/12*Math.PI*2)*2.8; if(x===-6) ctx.moveTo(x,y); else ctx.lineTo(x,y); }
+    ctx.stroke();
   } else if(pu.type==='wall'){
     // white box with a thick mid-gray-stroked white inner rectangle
     ctx.fillStyle='#fff';
@@ -641,6 +777,64 @@ function drawPowerupIcon(pu){
     ctx.moveTo(-3,5.6); ctx.lineTo(3,5.6); ctx.lineTo(0.9,2.6); ctx.lineTo(-0.9,2.6);
     ctx.closePath(); ctx.fill();
     ctx.fillRect(-0.4,-2.2,0.8,4);
+  } else if(pu.type==='safetile'){
+    // small black-stroked square with a small black shield inside
+    ctx.strokeStyle='#000'; ctx.lineWidth=1.2;
+    ctx.strokeRect(-5,-5,10,10);
+    ctx.save();
+    ctx.scale(0.55,0.55);
+    ctx.fillStyle='#000';
+    ctx.beginPath();
+    ctx.moveTo(0,-5); ctx.lineTo(4,-3); ctx.lineTo(4,1);
+    ctx.quadraticCurveTo(4,4.5,0,5.5);
+    ctx.quadraticCurveTo(-4,4.5,-4,1);
+    ctx.lineTo(-4,-3);
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  } else if(pu.type==='joker'){
+    // gold ring with a five-spike gold star inside
+    ctx.strokeStyle='#d4a017'; ctx.fillStyle='#d4a017'; ctx.lineWidth=1.2;
+    ctx.beginPath(); ctx.arc(0,0,5.6,0,Math.PI*2); ctx.stroke();
+    ctx.beginPath();
+    for(let i=0;i<10;i++){
+      const r=(i%2===0)?4:1.7;
+      const ang=(Math.PI*i)/5 - Math.PI/2;
+      const px=Math.cos(ang)*r, py=Math.sin(ang)*r;
+      if(i===0) ctx.moveTo(px,py); else ctx.lineTo(px,py);
+    }
+    ctx.closePath(); ctx.fill();
+  } else if(pu.type==='slotmachine'){
+    // three small question marks side by side, kept inside the box
+    ctx.fillStyle='#fff'; ctx.font='bold 6px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    ctx.fillText('?',-3.7,0.4); ctx.fillText('?',0,0.4); ctx.fillText('?',3.7,0.4);
+  } else if(pu.type==='magnet'||pu.type==='antimagnet'){
+    // horseshoe: half circle with a rectangle on each end
+    const anti=pu.type==='antimagnet';
+    const body=anti?'#ffffff':'#374151', endL=anti?'#facc15':'#2563eb', endR=anti?'#22c55e':'#dc2626';
+    ctx.lineWidth=3; ctx.strokeStyle=body; ctx.lineCap='butt';
+    ctx.beginPath(); ctx.arc(0,0.5,3.8,Math.PI,Math.PI*2); ctx.stroke();
+    ctx.fillStyle=endL; ctx.fillRect(-5.3,0.5,3,5.5);
+    ctx.fillStyle=endR; ctx.fillRect(2.3,0.5,3,5.5);
+  } else if(pu.type==='swap'){
+    // bent double-headed arrow: a half-circle stroke with pointy arrowheads on both ends
+    ctx.strokeStyle='#000'; ctx.fillStyle='#000'; ctx.lineWidth=1.3;
+    const r=4.2, a0=-2.0, a1=2.0;
+    ctx.beginPath();
+    ctx.arc(0,0,r,a0,a1,false);
+    ctx.stroke();
+    const head=(ang,dir)=>{
+      const px=Math.cos(ang)*r, py=Math.sin(ang)*r;
+      const tAng=Math.atan2(Math.cos(ang)*dir,-Math.sin(ang)*dir);
+      const size=4.4; // bigger, clearly visible pointy heads
+      ctx.beginPath();
+      ctx.moveTo(px+Math.cos(tAng)*1.2,py+Math.sin(tAng)*1.2);
+      ctx.lineTo(px+Math.cos(tAng+2.6)*size,py+Math.sin(tAng+2.6)*size);
+      ctx.lineTo(px+Math.cos(tAng-2.6)*size,py+Math.sin(tAng-2.6)*size);
+      ctx.closePath();
+      ctx.fill();
+    };
+    head(a0,-1);
+    head(a1,1);
   }
   ctx.restore();
 }
@@ -650,8 +844,72 @@ function render(){
   ctx.fillStyle='#e8e8e8'; ctx.fillRect(0,0,W,H);
   ctx.strokeStyle='#222'; ctx.lineWidth=2; ctx.strokeRect(1,1,W-2,H-2);
 
+  // water tiles: blue translucent with slowly drifting ripples (minimal animation)
+  if(state.water){
+    const wt=performance.now()/1000;
+    for(let r=0;r<state.water.length;r++) for(let c=0;c<state.water[r].length;c++){
+      if(!state.water[r][c]) continue;
+      const tx=GRID_MARGIN_X+c*GRID_CELL_W, ty=GRID_MARGIN_Y+r*GRID_CELL_H;
+      ctx.fillStyle='rgba(40,120,230,'+(0.36+0.04*Math.sin(wt*1.1+c*0.9+r*1.3)).toFixed(3)+')';
+      ctx.fillRect(tx,ty,GRID_CELL_W,GRID_CELL_H);
+      ctx.save(); ctx.beginPath(); ctx.rect(tx,ty,GRID_CELL_W,GRID_CELL_H); ctx.clip();
+      ctx.strokeStyle='rgba(255,255,255,0.26)'; ctx.lineWidth=1.5;
+      for(let k=0;k<3;k++){
+        const yy=ty+GRID_CELL_H*(0.25+0.25*k);
+        ctx.beginPath();
+        for(let x=0;x<=GRID_CELL_W;x+=6){
+          const py=yy+Math.sin((tx+x)*0.07+wt*1.5+k*2.1)*2.5;
+          if(x===0) ctx.moveTo(tx+x,py); else ctx.lineTo(tx+x,py);
+        }
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  // ripples where tanks touch/move through water (client-side only, purely cosmetic)
+  {
+    const rt=performance.now();
+    if(!window._ripples){ window._ripples=[]; window._ripState={}; }
+    const rips=window._ripples, rst=window._ripState;
+    for(const [id,p] of Object.entries(state.players||{})){
+      const c=Math.floor((p.x-GRID_MARGIN_X)/GRID_CELL_W), r=Math.floor((p.y-GRID_MARGIN_Y)/GRID_CELL_H);
+      const inW=!!(p.alive && state.water && state.water[r] && state.water[r][c]);
+      const st=rst[id]||(rst[id]={in:false,x:p.x,y:p.y,t:0});
+      if(inW){
+        const moved=Math.hypot(p.x-st.x,p.y-st.y);
+        if(!st.in){ rips.push({x:p.x,y:p.y,t:rt,big:true}); st.x=p.x; st.y=p.y; st.t=rt; } // splash on entry
+        else if(moved>5 && rt-st.t>260){ rips.push({x:p.x,y:p.y,t:rt,big:false}); st.x=p.x; st.y=p.y; st.t=rt; }
+      }
+      st.in=inW;
+    }
+    for(let i=rips.length-1;i>=0;i--){
+      const rp=rips[i], k=(rt-rp.t)/(rp.big?1200:900);
+      if(k>=1){ rips.splice(i,1); continue; }
+      ctx.strokeStyle='rgba(255,255,255,'+(0.95*(1-k)).toFixed(3)+')'; ctx.lineWidth=2.5;
+      ctx.beginPath(); ctx.arc(rp.x,rp.y,8+k*(rp.big?46:32),0,Math.PI*2); ctx.stroke();
+      ctx.strokeStyle='rgba(170,215,255,'+(0.8*(1-k)).toFixed(3)+')'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(rp.x,rp.y,4+k*(rp.big?30:20),0,Math.PI*2); ctx.stroke();
+      if(rp.big){ ctx.beginPath(); ctx.arc(rp.x,rp.y,2+k*14,0,Math.PI*2); ctx.stroke(); }
+    }
+  }
+
   ctx.fillStyle='#444';
   for(const w of maze) ctx.fillRect(w.x,w.y,w.w,w.h);
+
+  // solid blocks: indestructible whole-tile obstacles (only a black hole removes them)
+  for(const b of state.solidBlocks||[]){
+    const tx=GRID_MARGIN_X+b.col*GRID_CELL_W, ty=GRID_MARGIN_Y+b.row*GRID_CELL_H;
+    ctx.fillStyle='#34373d';
+    ctx.fillRect(tx,ty,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='#17181b'; ctx.lineWidth=3;
+    ctx.strokeRect(tx+1.5,ty+1.5,GRID_CELL_W-3,GRID_CELL_H-3);
+    ctx.strokeStyle='rgba(255,255,255,0.10)'; ctx.lineWidth=1;
+    ctx.beginPath();
+    ctx.moveTo(tx+8,ty+GRID_CELL_H-8); ctx.lineTo(tx+GRID_CELL_W-8,ty+8);
+    ctx.moveTo(tx+8,ty+8); ctx.lineTo(tx+GRID_CELL_W-8,ty+GRID_CELL_H-8);
+    ctx.stroke();
+  }
 
   // airstrike: the targeted tile fades to light red over the 1s warning
   // window - visible to everyone, computed directly from server state
@@ -689,7 +947,9 @@ function render(){
   for(const p of Object.values(state.players||{})){
     if(!p.frontTile) continue;
     const tileX=GRID_MARGIN_X+p.frontTile.col*GRID_CELL_W, tileY=GRID_MARGIN_Y+p.frontTile.row*GRID_CELL_H;
-    if(p.powerup==='wall'){
+    if(p.powerup==='water'){
+      ctx.fillStyle='rgba(70,150,255,0.45)';
+    } else if(p.powerup==='wall'||p.powerup==='safetile'){
       ctx.fillStyle=p.wallBlocked?'rgba(230,60,60,0.4)':'rgba(60,200,90,0.4)';
     } else {
       ctx.fillStyle='rgba(190,190,190,0.5)';
@@ -708,6 +968,15 @@ function render(){
     ctx.strokeStyle=lerpColor('#3a3d42','#8a0000',damageFrac);
     ctx.lineWidth=2;
     ctx.strokeRect(tileX+1,tileY+1,GRID_CELL_W-2,GRID_CELL_H-2);
+  }
+
+  // safetiles: translucent green zones (tanks drive through them, see server rules)
+  for(const st of state.safeTiles||[]){
+    const tx=GRID_MARGIN_X+st.col*GRID_CELL_W, ty=GRID_MARGIN_Y+st.row*GRID_CELL_H;
+    ctx.fillStyle='rgba(60,200,90,0.32)';
+    ctx.fillRect(tx,ty,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='rgba(30,150,60,0.55)'; ctx.lineWidth=2;
+    ctx.strokeRect(tx+1,ty+1,GRID_CELL_W-2,GRID_CELL_H-2);
   }
 
   for(const pu of state.powerups||[]) drawPowerupIcon(pu);
@@ -775,6 +1044,29 @@ function render(){
       ctx.fill();
       ctx.restore();
     }
+  }
+
+  // magnet / antimagnet beam: 1 tile thick, longer than the arena, stripes drift
+  // toward the tank (magnet) or away from it (antimagnet)
+  for(const p of Object.values(state.players||{})){
+    if(!p.alive||!p.magnetActive) continue;
+    const anti=p.powerup==='antimagnet';
+    const col=anti?'#ff8c1a':'#4f8cff';
+    const tile=(GRID_CELL_W+GRID_CELL_H)/2;
+    const cs=Math.cos(p.a), sn=Math.sin(p.a);
+    const sx=p.x+cs*22, sy=p.y+sn*22, ex=sx+cs*1500, ey=sy+sn*1500;
+    ctx.save();
+    ctx.lineCap='butt';
+    ctx.globalAlpha=0.22; ctx.strokeStyle=col; ctx.lineWidth=tile;
+    ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey); ctx.stroke();
+    ctx.globalAlpha=0.55; ctx.lineWidth=3; ctx.setLineDash([14,26]);
+    const off=(performance.now()/12)*(anti?-1:1);
+    for(const k of [-0.33,0,0.33]){
+      const ox=-sn*tile*k, oy=cs*tile*k;
+      ctx.lineDashOffset=off;
+      ctx.beginPath(); ctx.moveTo(sx+ox,sy+oy); ctx.lineTo(ex+ox,ey+oy); ctx.stroke();
+    }
+    ctx.restore();
   }
 
   // continuous thin aim line while carrying (but not yet firing) the laser
@@ -847,6 +1139,33 @@ function render(){
     ctx.restore();
   }
 
+  // swap tile-picker: same private-cursor mechanic as hacking, orange-themed
+  if(me && me.alive && me.swapTargeting){
+    const cx=me.swapCursorX, cy=me.swapCursorY;
+    const col=Math.min(GRID_COLS-1,Math.max(0,Math.floor((cx-GRID_MARGIN_X)/GRID_CELL_W)));
+    const row=Math.min(GRID_ROWS-1,Math.max(0,Math.floor((cy-GRID_MARGIN_Y)/GRID_CELL_H)));
+    const tileX=GRID_MARGIN_X+col*GRID_CELL_W, tileY=GRID_MARGIN_Y+row*GRID_CELL_H;
+    ctx.save();
+    ctx.fillStyle='rgba(255,140,0,0.35)';
+    ctx.fillRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.strokeStyle='rgba(255,140,0,0.9)';
+    ctx.lineWidth=2;
+    ctx.strokeRect(tileX,tileY,GRID_CELL_W,GRID_CELL_H);
+    ctx.restore();
+
+    ctx.save();
+    ctx.translate(cx,cy);
+    ctx.strokeStyle='#ff8c00';
+    ctx.lineWidth=4;
+    ctx.lineCap='round';
+    const sArmLen=10;
+    ctx.beginPath();
+    ctx.moveTo(-sArmLen,-sArmLen); ctx.lineTo(sArmLen,sArmLen);
+    ctx.moveTo(sArmLen,-sArmLen); ctx.lineTo(-sArmLen,sArmLen);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // airstrike tile-picker: same private-cursor mechanic as teleport, red-themed
   // and modeled on the homing icon (ring + center dot + crosshair ticks), just big
   if(me && me.alive && me.airstrikeTargeting){
@@ -910,6 +1229,15 @@ function render(){
       ctx.fillStyle=lerpColor('#111111','#ff0000',frac);
       ctx.beginPath(); ctx.arc(b.x,b.y,8*sizeMul,0,Math.PI*2); ctx.fill(); // 200% of the regular 4px bullet
       ctx.restore();
+    } else if(b.type==='fastbullet'){
+      // starts pink, ages toward red with bounces like a regular bullet
+      const frac=Math.min(1,(b.bounces||0)/(b.maxBounces||20));
+      ctx.fillStyle=lerpColor('#ff69b4','#ff0000',frac);
+      ctx.beginPath(); ctx.arc(b.x,b.y,4,0,Math.PI*2); ctx.fill();
+    } else if(b.type==='starbullet'){
+      // solid blue the whole flight, same size as a regular bullet
+      ctx.fillStyle='#1d4ed8';
+      ctx.beginPath(); ctx.arc(b.x,b.y,4,0,Math.PI*2); ctx.fill();
     } else if(b.type==='superbullet'){
       // smooth continuous fade cycling black -> yellow -> blue -> black - same size as a regular bullet
       const SB_STOPS=['#111111','#ffe600','#2b6fff','#111111'];
@@ -927,6 +1255,23 @@ function render(){
       ctx.fillStyle=lerpColor('#111111','#ff0000',frac);
       ctx.beginPath(); ctx.arc(b.x,b.y,r,0,Math.PI*2); ctx.fill();
     }
+  }
+
+  // health orbs: pulsing green orb + translucent green line to the tank it is currently healing
+  for(const o of state.healthOrbs||[]){
+    const tgt=o.targetId!=null?(state.players||{})[o.targetId]:null;
+    if(tgt && tgt.alive){
+      ctx.save();
+      ctx.strokeStyle='rgba(34,197,94,0.45)'; ctx.lineWidth=4; ctx.lineCap='round';
+      ctx.beginPath(); ctx.moveTo(o.x,o.y); ctx.lineTo(tgt.x,tgt.y); ctx.stroke();
+      ctx.restore();
+    }
+    const pulse=(Math.sin(clockNow/220)+1)/2; // 0..1
+    ctx.save();
+    ctx.fillStyle=lerpColor('#14532d','#39ff14',pulse);
+    ctx.beginPath(); ctx.arc(o.x,o.y,(o.r||12)*(0.92+0.08*pulse),0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle='rgba(20,83,45,0.8)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.restore();
   }
 
   // a-bomb shrapnel: deadly debris triangles, server-authoritative positions
@@ -965,10 +1310,10 @@ function render(){
       ctx.beginPath(); ctx.arc(p.x,p.y,20,0,Math.PI*2); ctx.stroke();
       ctx.restore();
     }
-    if(p.piloting){
-      // tank body dimmed/frozen while its RC rocket is out
+    if(p.piloting||p.droneActive){
+      // tank body dimmed/frozen while its RC rocket or drone is out
       ctx.save();
-      ctx.globalAlpha=0.5; ctx.strokeStyle='#a78bfa'; ctx.lineWidth=2;
+      ctx.globalAlpha=0.5; ctx.strokeStyle=p.droneActive?'#ff6b6b':'#a78bfa'; ctx.lineWidth=2;
       ctx.setLineDash([4,4]);
       ctx.beginPath(); ctx.arc(p.x,p.y,19,0,Math.PI*2); ctx.stroke();
       ctx.restore();
@@ -1031,7 +1376,7 @@ function render(){
     const label=p.name?p.name:('P'+id);
     ctx.fillText(label + (id==myControlledId()?' (you)':''), p.x, p.y-26);
 
-    const SHOTS_LEFT_MAP={powerbeam:'powerBeamShots', mg:'mgShots', superbullet:'superBulletShots', blackhole:'blackHoleShots', flamethrower:'flameFuel', wall:'wallShots'};
+    const SHOTS_LEFT_MAP={powerbeam:'powerBeamShots', mg:'mgShots', shotgun:'shotgunShots', superbullet:'superBulletShots', timeshield:'timeShieldAmmo', fastbullet:'fastBulletShots', blackhole:'blackHoleShots', flamethrower:'flameFuel', wall:'wallShots', water:'waterShots', magnet:'magnetAmmo', antimagnet:'magnetAmmo'};
     const shotsField=SHOTS_LEFT_MAP[p.powerup];
     if(shotsField && p[shotsField]>0){
       ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial';
@@ -1052,7 +1397,51 @@ function render(){
       ctx.fillStyle = hp<30 ? '#e63946' : hp<50 ? '#fb8500' : '#22c55e';
       ctx.fillRect(p.x-barW/2, barY, barW*frac, barH);
     }
+    if(p.waterLeft!=null){
+      // drowning countdown above the tank: 6s grace, then it turns red while hp drains
+      const secs=Math.ceil(p.waterLeft), draining=p.waterLeft<=0;
+      ctx.textAlign='center';
+      ctx.fillStyle=draining?'rgba(200,30,30,0.9)':'rgba(30,100,210,0.9)';
+      ctx.beginPath(); ctx.arc(p.x,p.y-54,11,0,Math.PI*2); ctx.fill();
+      ctx.fillStyle='#fff'; ctx.font='bold 13px Arial'; ctx.textBaseline='middle';
+      ctx.fillText(draining?'!':String(secs),p.x,p.y-54);
+      ctx.textBaseline='alphabetic';
+    }
+    if(p.timeShieldActive){
+      // translucent blue bubble so everyone can see the time shield is up
+      ctx.fillStyle='rgba(59,130,246,0.30)';
+      ctx.strokeStyle='rgba(30,64,175,0.7)'; ctx.lineWidth=2;
+      ctx.beginPath(); ctx.arc(p.x,p.y,24,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    }
     ctx.restore();
+  }
+
+  // drones: square as wide as the tank's short side - black X, dark gray
+  // rotor circles, red center box, plus a shots-left counter for everyone
+  for(const p of Object.values(state.players||{})){
+    if(!p.alive || !p.droneActive) continue;
+    const h=11; // DRONE_SIZE/2
+    ctx.save();
+    ctx.translate(p.droneX,p.droneY);
+    ctx.strokeStyle='#000'; ctx.lineWidth=3; ctx.lineCap='round';
+    ctx.beginPath();
+    ctx.moveTo(-h+4,-h+4); ctx.lineTo(h-4,h-4);
+    ctx.moveTo(h-4,-h+4); ctx.lineTo(-h+4,h-4);
+    ctx.stroke();
+    for(const [cx,cy] of [[-1,-1],[1,-1],[-1,1],[1,1]]){
+      ctx.beginPath(); ctx.arc(cx*(h-4),cy*(h-4),4.2,0,Math.PI*2);
+      ctx.fillStyle='#4a4a4a'; ctx.fill();
+      ctx.lineWidth=1; ctx.strokeStyle='#000'; ctx.stroke();
+    }
+    ctx.fillStyle='#e01010';
+    ctx.fillRect(-3.5,-3,7,6);
+    ctx.lineWidth=1; ctx.strokeStyle='#000';
+    ctx.strokeRect(-3.5,-3,7,6);
+    ctx.restore();
+    if(p.droneShots>0){
+      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial'; ctx.textAlign='center';
+      ctx.fillText(String(p.droneShots), p.droneX, p.droneY-h-6);
+    }
   }
 
   // explosions: ~1s fireball with expanding rings + flying colored particles
@@ -1178,7 +1567,7 @@ function render(){
     ctx.save();
     ctx.beginPath();
     ctx.arc(cw.x,cw.y,r,0,Math.PI*2);
-    ctx.fillStyle=`rgba(200,20,20,${alpha.toFixed(3)})`;
+    ctx.fillStyle=cw.kind==='heal' ? `rgba(30,190,70,${alpha.toFixed(3)})` : `rgba(200,20,20,${alpha.toFixed(3)})`;
     ctx.fill();
     ctx.restore();
   }
@@ -1289,40 +1678,130 @@ function render(){
     ctx.fillStyle='rgba(255,255,255,.85)'; ctx.fillRect(0,0,W,H);
     ctx.fillStyle='#111'; ctx.textAlign='center';
     ctx.font='bold 32px Arial';
-    ctx.fillText('Tank Trouble LAN', W/2, H/2-90);
+    ctx.fillText('Tank Trouble LAN', W/2, 70);
     ctx.font='18px Arial';
     const players=Object.entries(state.players||{});
     if(players.length===0){
-      ctx.fillText('Waiting for players to connect...', W/2, H/2-50);
+      ctx.fillText('Waiting for players to connect...', W/2, 104);
     } else {
-      ctx.fillText('Pick a color and name above, then press R when ready', W/2, H/2-50);
-      const readyText=players.map(([id,p])=>`${p.name||('P'+id)}:${p.ready?'ready':'not ready'}`).join('   ');
-      ctx.font='14px Arial';
-      ctx.fillText(readyText, W/2, H/2-24);
+      ctx.fillText('Pick a color and a name, then press R when ready', W/2, 104);
     }
   } else if(phase==='round' && state.lonely){
     ctx.fillStyle='#111'; ctx.textAlign='center'; ctx.font='bold 20px Arial';
     ctx.fillText(`Last one standing! Survive ${state.lonely.secondsLeft.toFixed(1)}s for the point!`, W/2, 30);
   } else if(phase==='roundend'){
-    ctx.fillStyle='rgba(255,255,255,.6)'; ctx.fillRect(0,0,W,H);
-    ctx.fillStyle='#111'; ctx.textAlign='center'; ctx.font='bold 26px Arial';
+    ctx.fillStyle='rgba(255,255,255,.82)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#111'; ctx.textAlign='center'; ctx.textBaseline='alphabetic'; ctx.font='bold 26px Arial';
     const info=state.roundEndInfo;
     if(info && info.winnerId!=null){
       const wp=state.players[info.winnerId];
-      ctx.fillText(`${wp&&wp.name?wp.name:('Player P'+info.winnerId)} survives the round! +1 point`, W/2, H/2);
+      ctx.fillText(`${wp&&wp.name?wp.name:('Player P'+info.winnerId)} survives the round! +1 point`, W/2, 60);
     } else {
-      ctx.fillText(`No one survives — no point this round`, W/2, H/2);
+      ctx.fillText(`No one survives — no point this round`, W/2, 60);
     }
-    ctx.font='16px Arial';
-    ctx.fillText('Next round starting...', W/2, H/2+32);
+    // full scoreboard, leader(s) highlighted
+    const list=Object.entries(state.players||{}).filter(([,p])=>!p.isClone).map(([id,p])=>({id,p})).sort((a,b)=>b.p.score-a.p.score);
+    const top=list.length?list[0].p.score:0;
+    const rowH=Math.min(62,(H-190)/Math.max(1,list.length));
+    let y=110;
+    for(const {id,p} of list){
+      const leader=top>0 && p.score===top;
+      const label=(p.name?p.name:('P'+id))+(id==myId?' (you)':'');
+      const bw=leader?520:440, bh=rowH-8;
+      if(leader){
+        ctx.fillStyle='rgba(255,200,0,0.45)'; ctx.fillRect(W/2-bw/2,y,bw,bh);
+        ctx.strokeStyle='#d4a017'; ctx.lineWidth=4; ctx.strokeRect(W/2-bw/2,y,bw,bh);
+      } else {
+        ctx.fillStyle='rgba(0,0,0,0.06)'; ctx.fillRect(W/2-bw/2,y,bw,bh);
+      }
+      ctx.fillStyle=p.color||'#888'; ctx.fillRect(W/2-bw/2+12,y+bh/2-14,28,28);
+      ctx.textBaseline='middle';
+      ctx.font=(leader?'bold 36px':'bold 28px')+' Arial';
+      ctx.fillStyle='#111';
+      ctx.textAlign='left'; ctx.fillText((leader?'👑 ':'')+label, W/2-bw/2+52, y+bh/2);
+      ctx.textAlign='right'; ctx.fillText(`${p.score} / ${state.winScore||10}`, W/2+bw/2-16, y+bh/2);
+      ctx.textBaseline='alphabetic'; ctx.textAlign='center';
+      y+=rowH;
+    }
+    ctx.fillStyle='#111'; ctx.font='16px Arial';
+    ctx.fillText('Next round starting...', W/2, H-24);
   } else if(phase==='gameover'){
     ctx.fillStyle='rgba(0,0,0,.7)'; ctx.fillRect(0,0,W,H);
     const w=state.gameWinner;
     ctx.fillStyle=w?w.color:'#fff';
-    ctx.textAlign='center'; ctx.font='bold 36px Arial';
-    ctx.fillText(w ? `yeey tank colored ${w.colorName} wins!!` : 'Game over!', W/2, H/2);
+    ctx.textAlign='center'; ctx.textBaseline='alphabetic'; ctx.font='bold 36px Arial';
+    const sts=w&&w.stats; const rows_n=6;
+    const topY=sts?H/2-125:H/2;
+    ctx.fillText(w ? `${w.name||'Player'} wins!` : 'Game over!', W/2, topY);
+    if(sts){
+      const rows=[['Most bullets shot',sts.shots],['Most powerups used',sts.powerups],['Most damage dealt',sts.dealt],['Most damage taken',sts.damage],['Most suicidal tank (self damage)',sts.suicidal],['Laziest tank (tiles touched)',sts.lazy]];
+      ctx.font='bold 18px Arial';
+      rows.forEach((r,i)=>{
+        const y=topY+46+i*30, item=r[1];
+        const label=r[0]+': ', val=` ${item.name} : ${item.value}`;
+        const others=(item.others||[]);
+        ctx.font='bold 18px Arial';
+        const lw=ctx.measureText(label).width, vw=ctx.measureText(val).width;
+        ctx.font='13px Arial';
+        const gap=12; let ow=0; for(const o of others) ow+=ctx.measureText(String(o.value)).width+10;
+        const total=lw+vw+(others.length?gap+ow:0);
+        const x0=W/2-total/2;
+        ctx.textAlign='left';
+        ctx.font='bold 18px Arial';
+        ctx.fillStyle='#ddd'; ctx.fillText(label,x0,y);
+        ctx.fillStyle=item.color||'#fff'; ctx.fillText(val,x0+lw,y);
+        // everyone else's number: smaller, colored, no names
+        ctx.font='13px Arial';
+        let ox=x0+lw+vw+gap;
+        for(const o of others){ ctx.fillStyle=o.color||'#fff'; const t=String(o.value); ctx.fillText(t,ox,y); ox+=ctx.measureText(t).width+10; }
+        ctx.font='bold 18px Arial';
+      });
+      ctx.textAlign='center';
+    }
     ctx.fillStyle='#fff'; ctx.font='16px Arial';
-    ctx.fillText('Click "Play Again" above to reset the game', W/2, H/2+38);
+    ctx.fillText('Click "Play Again" above to reset the game', W/2, (sts?topY+46+rows_n*30+14:H/2+38));
+  }
+
+  // joker picker: drawn last so it sits on top of everything, and only for the
+  // player whose tank is choosing. Grid size comes from the server, so powerups
+  // added later show up here automatically.
+  const jk=state.players[myControlledId()]||null;
+  const slotMode=!!(jk && jk.slotChoices && jk.slotChoices.length);
+  if(jk && jk.alive && jk.jokerSelecting && (slotMode || (state.jokerChoices && state.jokerChoices.length))){
+    const choices=slotMode?jk.slotChoices:state.jokerChoices, cols=slotMode?choices.length:(state.jokerCols||6), cell=slotMode?130:64;
+    const rows=Math.ceil(choices.length/cols);
+    const panelW=cols*cell+40, panelH=rows*cell+80;
+    const px=(W-panelW)/2, py=(H-panelH)/2;
+    ctx.save();
+    ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='rgba(25,25,30,0.96)'; ctx.fillRect(px,py,panelW,panelH);
+    ctx.strokeStyle=slotMode?'#ff2d2d':'#d4a017'; ctx.lineWidth=3; ctx.strokeRect(px,py,panelW,panelH);
+    ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+    ctx.fillStyle=slotMode?'#ff5555':'#fbbf24'; ctx.font='bold 18px Arial';
+    ctx.fillText(slotMode?'SLOT MACHINE - choose a powerup':'JOKER - choose a powerup',W/2,py+28);
+    ctx.fillStyle='#bbb'; ctx.font='12px Arial';
+    ctx.fillText(slotMode?'A / D / arrows: move   Space: take it':'WASD / arrows: move   Space: take it',W/2,py+47);
+    choices.forEach((type,i)=>{
+      const cx=px+20+(i%cols)*cell+cell/2, cy=py+66+Math.floor(i/cols)*cell+cell/2;
+      const sel=(i===jk.jokerIndex);
+      if(sel){
+        ctx.fillStyle='rgba(46,204,113,0.45)';
+        ctx.beginPath(); ctx.arc(cx,cy,cell*0.5,0,Math.PI*2); ctx.fill();
+      }
+      drawPowerupIcon({type:type,x:cx,y:cy,scale:slotMode?(sel?3.6:3):(sel?2:1.5)});
+    });
+    ctx.restore();
+  }
+
+  // tiny server performance readout, top-right corner
+  if(state.tickMs!=null){
+    ctx.save();
+    ctx.font='9px monospace';
+    ctx.textAlign='right';
+    ctx.textBaseline='top';
+    ctx.fillStyle='rgba(128,128,128,0.9)';
+    ctx.fillText('tick: '+state.tickMs+' ms', W-5, 4);
+    ctx.restore();
   }
 }
 
