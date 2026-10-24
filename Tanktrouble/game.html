@@ -61,9 +61,20 @@ const SHOW_HELP=false; // set to true to bring back the lobby help text listing 
 const helpEl=document.getElementById('help'),readyListEl=document.getElementById('readyList');
 let debugMode=false;
 const W=canvas.width,H=canvas.height;
-const GRID_COLS=9, GRID_ROWS=6, GRID_MARGIN_X=50, GRID_MARGIN_Y=40;
+const GRID_MARGIN_X=50, GRID_MARGIN_Y=40;
+// grid size changes every round (4x6, 6x9, 8x12, 10x15) - the server sends cols/rows with every state
+let GRID_COLS=9, GRID_ROWS=6;
 const DARKNESS_LIGHT_RADIUS=110; // size of the visible circle during darkness
-const GRID_CELL_W=(W-GRID_MARGIN_X*2)/GRID_COLS, GRID_CELL_H=(H-GRID_MARGIN_Y*2)/GRID_ROWS;
+let GRID_CELL_W=(W-GRID_MARGIN_X*2)/GRID_COLS, GRID_CELL_H=(H-GRID_MARGIN_Y*2)/GRID_ROWS;
+// fixed pixel "tile" used for tile-based effect sizes (matches the server's REF_TILE)
+const GRID_REF_TILE=((W-GRID_MARGIN_X*2)/9+(H-GRID_MARGIN_Y*2)/6)/2;
+let SC=1; // global size scale of every entity (tanks, bullets, powerups, ...) - sent by the server per grid size
+function applyGridSize(cols,rows,scale){
+  if(scale) SC=scale;
+  if(!cols||!rows||(cols===GRID_COLS&&rows===GRID_ROWS)) return;
+  GRID_COLS=cols; GRID_ROWS=rows;
+  GRID_CELL_W=(W-GRID_MARGIN_X*2)/GRID_COLS; GRID_CELL_H=(H-GRID_MARGIN_Y*2)/GRID_ROWS;
+}
 let ws, myId=null, maze=[];
 // Normally "my tank" is myId, but while piloting a clone, all the
 // targeting/visibility rendering below should track the clone instead -
@@ -226,6 +237,7 @@ function handleMessage(e){
       }
 
       state=m.state;
+      applyGridSize(m.state.cols,m.state.rows,m.state.scale);
       if(m.state.maze) maze=m.state.maze;
 
       if(!colorsBuilt && m.state.colors && m.state.colors.length) buildColorPicker(m.state.colors);
@@ -261,7 +273,7 @@ function handleMessage(e){
       const MAP_NAMES={empty:'Empty Lands',horizontal:'Horizontal Lines',maze:'Maze',blocks:'Solid Blocks',mixed:'Mixed Walls',islands:'Islands',waterwalls:'Water & Walls',lakes:'Lakes'};
       if(state.mapType && MAP_NAMES[state.mapType] && (state.gamePhase==='round'||state.gamePhase==='roundend')){
         const sm=document.createElement('small'); sm.style.cssText='font-size:11px;opacity:.7;margin-left:8px';
-        sm.textContent='Map: '+MAP_NAMES[state.mapType]; statusEl.appendChild(sm);
+        sm.textContent='Map: '+MAP_NAMES[state.mapType]+' · '+GRID_ROWS+'×'+GRID_COLS; statusEl.appendChild(sm);
       }
       if(debugMode) statusEl.textContent='DEBUG MODE (no server) · '+statusEl.textContent;
       helpEl.style.display = (SHOW_HELP && state.gamePhase==='lobby') ? '' : 'none'; // help only in the lobby (and only if SHOW_HELP)
@@ -454,7 +466,7 @@ function drawPowerupIcon(pu){
   const s=14;
   ctx.save();
   ctx.translate(pu.x,pu.y);
-  const sc=1.25*(pu.scale||1); ctx.scale(sc,sc); // 25% bigger overall (pu.scale lets the joker picker enlarge icons)
+  const sc=1.25*(pu.scale||1)*(pu.noSC?1:SC); ctx.scale(sc,sc); // 25% bigger overall (pu.scale lets the joker picker enlarge icons)
   ctx.fillStyle=POWERUP_BOX_COLORS[pu.type]||'#222';
   ctx.strokeStyle='#000';
   ctx.lineWidth=1;
@@ -887,10 +899,10 @@ function render(){
       const rp=rips[i], k=(rt-rp.t)/(rp.big?1200:900);
       if(k>=1){ rips.splice(i,1); continue; }
       ctx.strokeStyle='rgba(255,255,255,'+(0.95*(1-k)).toFixed(3)+')'; ctx.lineWidth=2.5;
-      ctx.beginPath(); ctx.arc(rp.x,rp.y,8+k*(rp.big?46:32),0,Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(rp.x,rp.y,(8+k*(rp.big?46:32))*SC,0,Math.PI*2); ctx.stroke();
       ctx.strokeStyle='rgba(170,215,255,'+(0.8*(1-k)).toFixed(3)+')'; ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(rp.x,rp.y,4+k*(rp.big?30:20),0,Math.PI*2); ctx.stroke();
-      if(rp.big){ ctx.beginPath(); ctx.arc(rp.x,rp.y,2+k*14,0,Math.PI*2); ctx.stroke(); }
+      ctx.beginPath(); ctx.arc(rp.x,rp.y,(4+k*(rp.big?30:20))*SC,0,Math.PI*2); ctx.stroke();
+      if(rp.big){ ctx.beginPath(); ctx.arc(rp.x,rp.y,(2+k*14)*SC,0,Math.PI*2); ctx.stroke(); }
     }
   }
 
@@ -985,20 +997,20 @@ function render(){
     if(l.kind==='powerbeam'){
       ctx.save();
       ctx.lineCap='round';
-      ctx.globalAlpha=0.5; ctx.strokeStyle=l.color; ctx.lineWidth=5;
+      ctx.globalAlpha=0.5; ctx.strokeStyle=l.color; ctx.lineWidth=5*SC;
       ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
-      ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=1.6;
+      ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=1.6*SC;
       ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
       ctx.restore();
       continue;
     }
     ctx.save();
     ctx.lineCap='round';
-    ctx.globalAlpha=0.22; ctx.strokeStyle=l.color; ctx.lineWidth=60;
+    ctx.globalAlpha=0.22; ctx.strokeStyle=l.color; ctx.lineWidth=60*SC;
     ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
-    ctx.globalAlpha=0.85; ctx.strokeStyle=l.color; ctx.lineWidth=10;
+    ctx.globalAlpha=0.85; ctx.strokeStyle=l.color; ctx.lineWidth=10*SC;
     ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
-    ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=3;
+    ctx.globalAlpha=0.95; ctx.strokeStyle='#fff'; ctx.lineWidth=3*SC;
     ctx.beginPath(); ctx.moveTo(l.x1,l.y1); ctx.lineTo(l.x2,l.y2); ctx.stroke();
     ctx.restore();
   }
@@ -1009,12 +1021,12 @@ function render(){
     if(!bl.points || bl.points.length<2) continue;
     ctx.save();
     ctx.lineCap='round'; ctx.lineJoin='round';
-    ctx.globalAlpha=0.35; ctx.strokeStyle='#0a1f5c'; ctx.lineWidth=6;
+    ctx.globalAlpha=0.35; ctx.strokeStyle='#0a1f5c'; ctx.lineWidth=6*SC;
     ctx.beginPath();
     ctx.moveTo(bl.points[0].x,bl.points[0].y);
     for(let i=1;i<bl.points.length;i++) ctx.lineTo(bl.points[i].x,bl.points[i].y);
     ctx.stroke();
-    ctx.globalAlpha=0.95; ctx.strokeStyle='#1e3a8a'; ctx.lineWidth=2;
+    ctx.globalAlpha=0.95; ctx.strokeStyle='#1e3a8a'; ctx.lineWidth=2*SC;
     ctx.beginPath();
     ctx.moveTo(bl.points[0].x,bl.points[0].y);
     for(let i=1;i<bl.points.length;i++) ctx.lineTo(bl.points[i].x,bl.points[i].y);
@@ -1032,10 +1044,10 @@ function render(){
     const segments=20; // tripled+ so circles overlap along the full length instead of leaving gaps
     for(let i=0;i<segments;i++){
       const t=(i+0.5)/segments;
-      const dist=15+t*p.flameLen; // 15 ~= tank radius, so it starts at the tank's edge
+      const dist=15*SC+t*p.flameLen; // 15 ~= tank radius, so it starts at the tank's edge
       const flicker=0.7+0.3*Math.sin(flameClockNow/60+i*1.7+p.x*0.01);
       const segX=p.x+cosA*dist, segY=p.y+sinA*dist;
-      const w=(1-t*0.5)*13*flicker;
+      const w=(1-t*0.5)*13*SC*flicker;
       ctx.save();
       ctx.globalAlpha=0.85*(1-t*0.3);
       ctx.fillStyle=i%2===0?'#ff6a00':'#ff2d00';
@@ -1052,14 +1064,14 @@ function render(){
     if(!p.alive||!p.magnetActive) continue;
     const anti=p.powerup==='antimagnet';
     const col=anti?'#ff8c1a':'#4f8cff';
-    const tile=(GRID_CELL_W+GRID_CELL_H)/2;
+    const tile=GRID_REF_TILE*SC;
     const cs=Math.cos(p.a), sn=Math.sin(p.a);
-    const sx=p.x+cs*22, sy=p.y+sn*22, ex=sx+cs*1500, ey=sy+sn*1500;
+    const sx=p.x+cs*22*SC, sy=p.y+sn*22*SC, ex=sx+cs*1500, ey=sy+sn*1500;
     ctx.save();
     ctx.lineCap='butt';
     ctx.globalAlpha=0.22; ctx.strokeStyle=col; ctx.lineWidth=tile;
     ctx.beginPath(); ctx.moveTo(sx,sy); ctx.lineTo(ex,ey); ctx.stroke();
-    ctx.globalAlpha=0.55; ctx.lineWidth=3; ctx.setLineDash([14,26]);
+    ctx.globalAlpha=0.55; ctx.lineWidth=3*SC; ctx.setLineDash([14*SC,26*SC]);
     const off=(performance.now()/12)*(anti?-1:1);
     for(const k of [-0.33,0,0.33]){
       const ox=-sn*tile*k, oy=cs*tile*k;
@@ -1072,11 +1084,11 @@ function render(){
   // continuous thin aim line while carrying (but not yet firing) the laser
   const me=state.players[myControlledId()]||null;
   if(me && me.alive && me.powerup==='laser'){
-    const aimLen=((GRID_CELL_W+GRID_CELL_H)/2)*3; // 3 tiles long
+    const aimLen=GRID_REF_TILE*SC*3; // 3 tiles long
     ctx.save();
-    ctx.setLineDash([6,6]);
+    ctx.setLineDash([6*SC,6*SC]);
     ctx.strokeStyle='rgba(230,20,20,0.75)';
-    ctx.lineWidth=1.5;
+    ctx.lineWidth=1.5*SC;
     ctx.beginPath();
     ctx.moveTo(me.x,me.y);
     ctx.lineTo(me.x+Math.cos(me.a)*aimLen, me.y+Math.sin(me.a)*aimLen);
@@ -1100,7 +1112,7 @@ function render(){
 
     // thick blue cross marking the exact cursor point, floating above the tank
     ctx.save();
-    ctx.translate(cx,cy);
+    ctx.translate(cx,cy); ctx.scale(SC,SC);
     ctx.strokeStyle='#2b7de9';
     ctx.lineWidth=4;
     ctx.lineCap='round';
@@ -1127,7 +1139,7 @@ function render(){
     ctx.restore();
 
     ctx.save();
-    ctx.translate(cx,cy);
+    ctx.translate(cx,cy); ctx.scale(SC,SC);
     ctx.strokeStyle='#22c700';
     ctx.lineWidth=4;
     ctx.lineCap='round';
@@ -1154,7 +1166,7 @@ function render(){
     ctx.restore();
 
     ctx.save();
-    ctx.translate(cx,cy);
+    ctx.translate(cx,cy); ctx.scale(SC,SC);
     ctx.strokeStyle='#ff8c00';
     ctx.lineWidth=4;
     ctx.lineCap='round';
@@ -1182,7 +1194,7 @@ function render(){
     ctx.restore();
 
     ctx.save();
-    ctx.translate(cx,cy);
+    ctx.translate(cx,cy); ctx.scale(SC,SC);
     ctx.strokeStyle='#e60000';
     ctx.fillStyle='#e60000';
     ctx.lineWidth=4;
@@ -1199,6 +1211,7 @@ function render(){
 
   const clockNow=simClock();
   for(const b of state.bullets||[]){
+    ctx.save(); ctx.translate(b.x,b.y); ctx.scale(SC,SC); ctx.translate(-b.x,-b.y);
     if(b.type==='homing'){
       const age=b.spawnTime!=null?(clockNow-b.spawnTime):0;
       const frac=b.maxLife?Math.min(1,age/b.maxLife):0;
@@ -1255,6 +1268,7 @@ function render(){
       ctx.fillStyle=lerpColor('#111111','#ff0000',frac);
       ctx.beginPath(); ctx.arc(b.x,b.y,r,0,Math.PI*2); ctx.fill();
     }
+    ctx.restore();
   }
 
   // health orbs: pulsing green orb + translucent green line to the tank it is currently healing
@@ -1262,7 +1276,7 @@ function render(){
     const tgt=o.targetId!=null?(state.players||{})[o.targetId]:null;
     if(tgt && tgt.alive){
       ctx.save();
-      ctx.strokeStyle='rgba(34,197,94,0.45)'; ctx.lineWidth=4; ctx.lineCap='round';
+      ctx.strokeStyle='rgba(34,197,94,0.45)'; ctx.lineWidth=4*SC; ctx.lineCap='round';
       ctx.beginPath(); ctx.moveTo(o.x,o.y); ctx.lineTo(tgt.x,tgt.y); ctx.stroke();
       ctx.restore();
     }
@@ -1270,14 +1284,14 @@ function render(){
     ctx.save();
     ctx.fillStyle=lerpColor('#14532d','#39ff14',pulse);
     ctx.beginPath(); ctx.arc(o.x,o.y,(o.r||12)*(0.92+0.08*pulse),0,Math.PI*2); ctx.fill();
-    ctx.strokeStyle='rgba(20,83,45,0.8)'; ctx.lineWidth=1.5; ctx.stroke();
+    ctx.strokeStyle='rgba(20,83,45,0.8)'; ctx.lineWidth=1.5*SC; ctx.stroke();
     ctx.restore();
   }
 
   // a-bomb shrapnel: deadly debris triangles, server-authoritative positions
   for(const s of state.shrapnel||[]){
     ctx.save();
-    ctx.translate(s.x,s.y);
+    ctx.translate(s.x,s.y); ctx.scale(SC,SC);
     ctx.rotate(s.angle);
     ctx.fillStyle='#2b2b2b';
     ctx.strokeStyle='#000';
@@ -1294,6 +1308,7 @@ function render(){
     if(!p.alive) continue;
     if(p.ghosted && id!=myControlledId()) continue; // invisible to everyone except its own pilot
     ctx.save();
+    ctx.translate(p.x,p.y); ctx.scale(SC,SC); ctx.translate(-p.x,-p.y);
     if(p.ghosted) ctx.globalAlpha=0.5; // the pilot still sees their own tank, just translucent
     if(p.isClone) ctx.globalAlpha=(ctx.globalAlpha||1)*0.55; // clones read as copies
     if(p.glow){
@@ -1372,17 +1387,17 @@ function render(){
       ctx.restore();
     }
 
-    ctx.fillStyle='#111'; ctx.font='11px Arial'; ctx.textAlign='center';
+    ctx.fillStyle='#111'; ctx.font=Math.max(11,9/SC)+'px Arial'; ctx.textAlign='center';
     const label=p.name?p.name:('P'+id);
     ctx.fillText(label + (id==myControlledId()?' (you)':''), p.x, p.y-26);
 
     const SHOTS_LEFT_MAP={powerbeam:'powerBeamShots', mg:'mgShots', shotgun:'shotgunShots', superbullet:'superBulletShots', timeshield:'timeShieldAmmo', fastbullet:'fastBulletShots', blackhole:'blackHoleShots', flamethrower:'flameFuel', wall:'wallShots', water:'waterShots', magnet:'magnetAmmo', antimagnet:'magnetAmmo'};
     const shotsField=SHOTS_LEFT_MAP[p.powerup];
     if(shotsField && p[shotsField]>0){
-      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial';
+      ctx.fillStyle='#e63946'; ctx.font='bold '+Math.max(15,11/SC)+'px Arial';
       ctx.fillText(String(p[shotsField]), p.x, p.y-40);
     } else if(p.hacking && p.hackSecondsLeft>0){
-      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial';
+      ctx.fillStyle='#e63946'; ctx.font='bold '+Math.max(15,11/SC)+'px Arial';
       ctx.fillText(String(p.hackSecondsLeft), p.x, p.y-40);
     }
 
@@ -1403,7 +1418,7 @@ function render(){
       ctx.textAlign='center';
       ctx.fillStyle=draining?'rgba(200,30,30,0.9)':'rgba(30,100,210,0.9)';
       ctx.beginPath(); ctx.arc(p.x,p.y-54,11,0,Math.PI*2); ctx.fill();
-      ctx.fillStyle='#fff'; ctx.font='bold 13px Arial'; ctx.textBaseline='middle';
+      ctx.fillStyle='#fff'; ctx.font='bold '+Math.max(13,10/SC)+'px Arial'; ctx.textBaseline='middle';
       ctx.fillText(draining?'!':String(secs),p.x,p.y-54);
       ctx.textBaseline='alphabetic';
     }
@@ -1422,7 +1437,7 @@ function render(){
     if(!p.alive || !p.droneActive) continue;
     const h=11; // DRONE_SIZE/2
     ctx.save();
-    ctx.translate(p.droneX,p.droneY);
+    ctx.translate(p.droneX,p.droneY); ctx.scale(SC,SC);
     ctx.strokeStyle='#000'; ctx.lineWidth=3; ctx.lineCap='round';
     ctx.beginPath();
     ctx.moveTo(-h+4,-h+4); ctx.lineTo(h-4,h-4);
@@ -1439,14 +1454,15 @@ function render(){
     ctx.strokeRect(-3.5,-3,7,6);
     ctx.restore();
     if(p.droneShots>0){
-      ctx.fillStyle='#e63946'; ctx.font='bold 15px Arial'; ctx.textAlign='center';
-      ctx.fillText(String(p.droneShots), p.droneX, p.droneY-h-6);
+      ctx.fillStyle='#e63946'; ctx.font='bold '+Math.max(15,11/SC)+'px Arial'; ctx.textAlign='center';
+      ctx.fillText(String(p.droneShots), p.droneX, p.droneY-(h+6)*SC);
     }
   }
 
   // explosions: ~1s fireball with expanding rings + flying colored particles
   explosions=explosions.filter(ex=>now-ex.start<1000);
   for(const ex of explosions){
+    ctx.save(); ctx.translate(ex.x,ex.y); ctx.scale(SC,SC); ctx.translate(-ex.x,-ex.y);
     const t=now-ex.start;
     const prog=Math.min(t/1000,1);
 
@@ -1489,11 +1505,13 @@ function render(){
       ctx.fill();
       ctx.restore();
     }
+    ctx.restore();
   }
 
   // muzzle smoke puffs (0.5s, tiny gray particles from the cannon end)
   muzzleSmokes=muzzleSmokes.filter(sm=>now-sm.start<500);
   for(const sm of muzzleSmokes){
+    ctx.save(); ctx.translate(sm.x,sm.y); ctx.scale(SC,SC); ctx.translate(-sm.x,-sm.y);
     const t=now-sm.start;
     for(const p of sm.particles){
       const pt=t-p.delay;
@@ -1511,11 +1529,13 @@ function render(){
       ctx.fill();
       ctx.restore();
     }
+    ctx.restore();
   }
 
   // a-bomb detonation fireball (~1s, monochrome flash + rings + debris puffs)
   abombBlasts=abombBlasts.filter(ex=>now-ex.start<1000);
   for(const ex of abombBlasts){
+    ctx.save(); ctx.translate(ex.x,ex.y); ctx.scale(SC,SC); ctx.translate(-ex.x,-ex.y);
     const t=now-ex.start;
     const prog=Math.min(t/1000,1);
 
@@ -1552,6 +1572,7 @@ function render(){
       ctx.fill();
       ctx.restore();
     }
+    ctx.restore();
   }
 
   // "clean" powerup: growing translucent red wave from the activator's tank,
@@ -1594,6 +1615,7 @@ function render(){
     const age=airstrikeClockNow-ex.confirmTime;
     const t=age-1000; // ms into the 0.5s explosion window
     if(t<0||t>500) continue;
+    ctx.save(); ctx.translate(ex.cx,ex.cy); ctx.scale(SC,SC); ctx.translate(-ex.cx,-ex.cy);
     const prog=t/500;
 
     if(t<120){
@@ -1632,6 +1654,7 @@ function render(){
       ctx.fill();
       ctx.restore();
     }
+    ctx.restore();
   }
 
   // darkness: everything is blacked out except a circle of light that follows
@@ -1644,8 +1667,8 @@ function render(){
     ctx.beginPath();
     ctx.rect(0,0,W,H);
     if(meDark && meDark.alive){
-      ctx.moveTo(meDark.x+DARKNESS_LIGHT_RADIUS,meDark.y);
-      ctx.arc(meDark.x,meDark.y,DARKNESS_LIGHT_RADIUS,0,Math.PI*2,true);
+      ctx.moveTo(meDark.x+(DARKNESS_LIGHT_RADIUS*SC),meDark.y);
+      ctx.arc(meDark.x,meDark.y,(DARKNESS_LIGHT_RADIUS*SC),0,Math.PI*2,true);
     }
     ctx.fillStyle=`rgba(0,0,0,${alpha})`;
     ctx.fill('evenodd');
@@ -1654,7 +1677,7 @@ function render(){
       ctx.save();
       ctx.strokeStyle='rgba(255,240,180,0.25)';
       ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(meDark.x,meDark.y,DARKNESS_LIGHT_RADIUS,0,Math.PI*2); ctx.stroke();
+      ctx.beginPath(); ctx.arc(meDark.x,meDark.y,(DARKNESS_LIGHT_RADIUS*SC),0,Math.PI*2); ctx.stroke();
       ctx.restore();
     }
   }
@@ -1788,7 +1811,7 @@ function render(){
         ctx.fillStyle='rgba(46,204,113,0.45)';
         ctx.beginPath(); ctx.arc(cx,cy,cell*0.5,0,Math.PI*2); ctx.fill();
       }
-      drawPowerupIcon({type:type,x:cx,y:cy,scale:slotMode?(sel?3.6:3):(sel?2:1.5)});
+      drawPowerupIcon({noSC:true,type:type,x:cx,y:cy,scale:slotMode?(sel?3.6:3):(sel?2:1.5)});
     });
     ctx.restore();
   }

@@ -38,17 +38,46 @@ wss = new WebSocket.Server({ server });
 
 // ---------- arena / maze setup ----------
 const ARENA_W = 1000, ARENA_H = 650;
-const COLS = 9, ROWS = 6;
 const MARGIN_X = 50, MARGIN_Y = 40;
-const CELL_W = (ARENA_W - MARGIN_X * 2) / COLS;
-const CELL_H = (ARENA_H - MARGIN_Y * 2) / ROWS;
-const WALL_T = 10;
+let WALL_T = 10;
+// Global size scale per grid size, relative to the classic 6x9 (rows x cols) arena.
+// Tanks, bullets, powerups, walls, beams, speeds... are all multiplied by this.
+const SCALE_BY_ROWS = { 4: 4 / 3, 6: 1, 8: 0.75, 10: 0.6 };
+let SC = 1;
+let CONSTS_READY = false; // becomes true once the tuning constants below exist (applyScale needs them)
 
+// The arena always fills the same pixel area, but every round picks one of these
+// grid sizes (cols x rows, all 3:2). More tiles = smaller tiles, tanks stay the same size.
+const GRID_SIZES = [
+    { cols: 6, rows: 4 },
+    { cols: 9, rows: 6 },
+    { cols: 12, rows: 8 },
+    { cols: 15, rows: 10 }
+];
+// Reference tile (the classic 9x6 tile, in pixels). Everything that used to be measured in
+// "tiles" in pixels-terms (flame length, magnet width, shrapnel reach, powerup spacing...)
+// stays tied to this so gameplay feels identical on every grid size.
+const REF_TILE = ((ARENA_W - MARGIN_X * 2) / 9 + (ARENA_H - MARGIN_Y * 2) / 6) / 2;
+
+// Current grid - these are reassigned by setGridSize() whenever a new map is generated.
+let COLS = 9, ROWS = 6;
+let CELL_W = 0, CELL_H = 0;
 // Center point of every maze cell - always open space, used for spawns & powerups.
-const CELL_CENTERS = [];
-for (let r = 0; r < ROWS; r++)
-    for (let c = 0; c < COLS; c++)
-        CELL_CENTERS.push({ col: c, row: r, x: MARGIN_X + c * CELL_W + CELL_W / 2, y: MARGIN_Y + r * CELL_H + CELL_H / 2 });
+let CELL_CENTERS = [];
+function setGridSize(cols, rows) {
+    COLS = cols; ROWS = rows;
+    SC = SCALE_BY_ROWS[rows] || 1;
+    if (CONSTS_READY) applyScale();
+    CELL_W = (ARENA_W - MARGIN_X * 2) / COLS;
+    CELL_H = (ARENA_H - MARGIN_Y * 2) / ROWS;
+    CELL_CENTERS = [];
+    for (let r = 0; r < ROWS; r++)
+        for (let c = 0; c < COLS; c++)
+            CELL_CENTERS.push({ col: c, row: r, x: MARGIN_X + c * CELL_W + CELL_W / 2, y: MARGIN_Y + r * CELL_H + CELL_H / 2 });
+}
+setGridSize(9, 6);
+// scale factor relative to the classic 54-tile map (used to scale wall/block/lake counts)
+function areaScale() { return Math.sqrt((ROWS * COLS) / 54); }
 
 function wallsToGeometry(hWalls, vWalls) {
     const rects = [];
@@ -146,7 +175,7 @@ function generateMazeType(loopChance = 0.15) {
 // almost never has to reject one, but the check keeps the guarantee airtight.
 function generateEmptyLandsType() {
     const { hWalls, vWalls } = blankWalls();
-    const TARGET_WALLS = 10;
+    const TARGET_WALLS = Math.max(3, Math.round(10 * ROWS * COLS / 54));
     let placed = 0, attempts = 0;
     while (placed < TARGET_WALLS && attempts < 400) {
         attempts++;
@@ -199,7 +228,7 @@ function generateHorizontalLinesType() {
 // ---------- extra arena types: solid blocks, mixed, islands ----------
 const MAX_SOLID_FRAC_BLOCKS = 0.40; // "solid blocks" map: at most 40% of tiles
 const MAX_SOLID_FRAC_MIXED = 0.15;  // "mixed" map: at most 15% of tiles
-const ISLAND_COUNT = 4;
+const ISLAND_COUNT_BY_ROWS = { 4: 2, 6: 4, 8: 5, 10: 6 }; // islands per grid size
 
 // Connectivity over CELLS, treating solid-block cells as removed. Walls still
 // separate neighbours. Guarantees every non-block tile can reach every other.
@@ -256,8 +285,8 @@ function blocksFromGrid(blk) {
 function generateSolidBlocksType() {
     const { hWalls, vWalls } = blankWalls();
     const blk = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
-    const maxBlocks = Math.floor(ROWS * COLS * MAX_SOLID_FRAC_BLOCKS);
-    const count = Math.max(10, maxBlocks - Math.floor(Math.random() * 10)); // 12..21 of 54
+    const area = ROWS * COLS;
+    const count = Math.max(4, Math.floor(area * (0.22 + Math.random() * (MAX_SOLID_FRAC_BLOCKS - 0.22)))); // ~22%..40% of the tiles
     placeSolidBlocks(hWalls, vWalls, blk, count, true);
     return { hWalls, vWalls, blocks: blocksFromGrid(blk) };
 }
@@ -266,8 +295,8 @@ function generateSolidBlocksType() {
 function generateMixedType() {
     const { hWalls, vWalls } = generateMazeType(0.28);
     const blk = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
-    const maxBlocks = Math.floor(ROWS * COLS * MAX_SOLID_FRAC_MIXED);
-    const count = Math.max(4, maxBlocks - Math.floor(Math.random() * 3)); // 6..8 of 54
+    const area = ROWS * COLS;
+    const count = Math.max(2, Math.floor(area * (0.11 + Math.random() * (MAX_SOLID_FRAC_MIXED - 0.11)))); // ~11%..15% of the tiles
     placeSolidBlocks(hWalls, vWalls, blk, count, false);
     // drop line walls that touch a block so the two wall styles don't clutter each other
     for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
@@ -283,6 +312,9 @@ function generateMixedType() {
 function generateIslandsType() {
     const { hWalls, vWalls } = blankWalls();
     const dirs4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    const ISLAND_COUNT = ISLAND_COUNT_BY_ROWS[ROWS] || 4;
+    const sc = areaScale();
+    const minIsle = Math.max(2, Math.round(3 * sc)), maxIsle = Math.max(minIsle + 1, Math.round(6 * sc));
     let land = null;
     for (let attempt = 0; attempt < 400 && !land; attempt++) {
         const id = Array.from({ length: ROWS }, () => Array(COLS).fill(-1));
@@ -310,7 +342,7 @@ function generateIslandsType() {
             cells.push([s0]);
         }
         if (!ok) continue;
-        const targets = cells.map(() => 3 + Math.floor(Math.random() * 4)); // 3..6 tiles each
+        const targets = cells.map(() => minIsle + Math.floor(Math.random() * (maxIsle - minIsle + 1))); // scaled with map size
         for (let i = 0; i < ISLAND_COUNT; i++) {
             for (let tries = 0; tries < 60 && cells[i].length < targets[i]; tries++) {
                 const base = cells[i][Math.floor(Math.random() * cells[i].length)];
@@ -319,13 +351,18 @@ function generateIslandsType() {
                 if (r < 0 || r >= ROWS || c < 0 || c >= COLS || id[r][c] !== -1 || touchesOther(r, c, i)) continue;
                 id[r][c] = i; cells[i].push([r, c]);
             }
-            if (cells[i].length < 3) ok = false;
+            if (cells[i].length < minIsle) ok = false;
         }
         if (ok) land = id;
     }
-    if (!land) { // guaranteed fallback: four 2x2 islands
+    if (!land) { // guaranteed fallback: a lattice of 2x2 islands, 1 tile of water between them
         land = Array.from({ length: ROWS }, () => Array(COLS).fill(-1));
-        [[0, 1], [0, 6], [3, 1], [3, 6]].forEach(([r0, c0], i) => { for (let r = r0; r < r0 + 2; r++) for (let c = c0; c < c0 + 2; c++) land[r][c] = i; });
+        let n = 0;
+        for (let r0 = 0; r0 + 1 < ROWS; r0 += 3)
+            for (let c0 = 0; c0 + 1 < COLS; c0 += 3) {
+                for (let r = r0; r < r0 + 2; r++) for (let c = c0; c < c0 + 2; c++) land[r][c] = n;
+                n++;
+            }
     }
     const water = land.map(row => row.map(v => v === -1));
     return { hWalls, vWalls, water };
@@ -334,6 +371,8 @@ function generateIslandsType() {
 // Two big landmasses split by a winding river (max 30% water) plus a few regular walls.
 function generateWaterWallsType() {
     const maxWater = Math.floor(ROWS * COLS * 0.30);
+    const riverMarginC = Math.max(1, Math.floor(COLS * 2 / 9));
+    const minLand = Math.max(3, Math.floor(ROWS * COLS * 0.22));
     const comps = (water) => {
         const seen = Array.from({ length: ROWS }, () => Array(COLS).fill(false)); const sizes = [];
         for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
@@ -351,15 +390,15 @@ function generateWaterWallsType() {
         const w = Array.from({ length: ROWS }, () => Array(COLS).fill(false));
         const step = () => { const v = Math.random(); return v < 0.35 ? -1 : v < 0.7 ? 1 : 0; };
         if (Math.random() < 0.5) { // river runs top to bottom
-            let c = 3 + Math.floor(Math.random() * 3);
+            let c = Math.floor(COLS / 3) + Math.floor(Math.random() * Math.ceil(COLS / 3));
             for (let r = 0; r < ROWS; r++) {
                 w[r][c] = true;
-                const nc = Math.min(COLS - 3, Math.max(2, c + step()));
+                const nc = Math.min(COLS - 1 - riverMarginC, Math.max(riverMarginC, c + step()));
                 for (let k = Math.min(c, nc); k <= Math.max(c, nc); k++) w[r][k] = true;
                 c = nc;
             }
         } else { // river runs left to right
-            let r = 2 + Math.floor(Math.random() * 2);
+            let r = Math.floor(ROWS / 3) + Math.floor(Math.random() * Math.ceil(ROWS / 3));
             for (let c = 0; c < COLS; c++) {
                 w[r][c] = true;
                 const nr = Math.min(ROWS - 2, Math.max(1, r + step()));
@@ -369,9 +408,9 @@ function generateWaterWallsType() {
         }
         let count = 0; for (const row of w) for (const v of row) if (v) count++;
         const sizes = comps(w);
-        if (count <= maxWater && sizes.length === 2 && Math.min(...sizes) >= 12) water = w;
+        if (count <= maxWater && sizes.length === 2 && Math.min(...sizes) >= minLand) water = w;
     }
-    if (!water) { water = Array.from({ length: ROWS }, () => Array(COLS).fill(false)); for (let r = 0; r < ROWS; r++) water[r][4] = true; }
+    if (!water) { water = Array.from({ length: ROWS }, () => Array(COLS).fill(false)); for (let r = 0; r < ROWS; r++) water[r][Math.floor(COLS / 2)] = true; }
     const { hWalls, vWalls } = generateEmptyLandsType(); // low density regular walls
     return { hWalls, vWalls, water };
 }
@@ -379,12 +418,14 @@ function generateWaterWallsType() {
 // Medium-density maze walls plus 2-3 small separate lakes (under 15% water).
 function generateLakesType() {
     const { hWalls, vWalls } = generateMazeType(0.4);
-    const maxWater = Math.min(Math.floor(ROWS * COLS * 0.15), 8);
+    const sc = areaScale();
+    const maxWater = Math.max(3, Math.floor(ROWS * COLS * 0.15));
+    const minWater = Math.max(2, Math.floor(4 * sc));
     const dirs4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
     let water = null;
     for (let attempt = 0; attempt < 300 && !water; attempt++) {
         const id = Array.from({ length: ROWS }, () => Array(COLS).fill(-1));
-        const lakes = 2 + Math.floor(Math.random() * 2);
+        const lakes = Math.max(2, Math.round((2 + Math.floor(Math.random() * 2)) * sc));
         const near = (r, c, me) => { for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) {
             const x = r + dr, y = c + dc; if (x < 0 || y < 0 || x >= ROWS || y >= COLS) continue;
             if (id[x][y] !== -1 && id[x][y] !== me) return true; } return false; };
@@ -406,13 +447,16 @@ function generateLakesType() {
             }
             total += cells.length;
         }
-        if (ok && total <= maxWater && total >= 4) water = id.map(row => row.map(v => v !== -1));
+        if (ok && total <= maxWater && total >= minWater) water = id.map(row => row.map(v => v !== -1));
     }
-    if (!water) { water = Array.from({ length: ROWS }, () => Array(COLS).fill(false)); water[1][1] = water[1][2] = water[4][6] = water[4][7] = true; }
+    if (!water) { water = Array.from({ length: ROWS }, () => Array(COLS).fill(false)); water[1][1] = water[1][2] = water[ROWS - 2][COLS - 3] = water[ROWS - 2][COLS - 2] = true; }
     return { hWalls, vWalls, water };
 }
 
 function generateMaze() {
+    // every round: random grid size (4x6, 6x9, 8x12 or 10x15) AND random map type
+    const size = GRID_SIZES[Math.floor(Math.random() * GRID_SIZES.length)];
+    setGridSize(size.cols, size.rows);
     const types = ["empty", "horizontal", "maze", "blocks", "mixed", "islands", "waterwalls", "lakes"];
     const type = types[Math.floor(Math.random() * types.length)];
     const gen = type === "empty" ? generateEmptyLandsType
@@ -428,6 +472,7 @@ function generateMaze() {
     geo.blocks = out.blocks || [];
     geo.water = out.water || null;
     geo.type = type;
+    geo.cols = COLS; geo.rows = ROWS;
     return geo;
 }
 
@@ -467,12 +512,14 @@ function isWaterAt(x, y) {
 function landCells() { return CELL_CENTERS.filter(cc => !isBlockCell(cc.col, cc.row) && !isWaterCell(cc.col, cc.row)); }
 
 const WATER_TANK_SPEED = 0.3;   // fraction of base speed in water (nitro restores regular speed)
-const WATER_BULLET_SPEED = 0.5; // bullets slow to this in water
+const WATER_BULLET_SPEED = 0.5; // other projectile types slow to this in water
+// regular bullets: lose 3% of their original speed for every 0.1s spent in water, keep the
+// reduced speed after leaving it, and die once the total reduction reaches 95%
+const WATER_DRAG_STEP = 0.03, WATER_DRAG_INTERVAL = 100, WATER_DRAG_DEATH = 0.95;
 const WATER_GRACE_MS = 6000;    // time in water before drowning starts
 const WATER_DAMAGE = 10, WATER_DAMAGE_INTERVAL = 1000;
 
 let mazeWalls = [], mazeSegments = [];
-applyMap(generateMaze());
 
 function pickDistinctSpawns(n) {
     const arr = landCells();
@@ -552,7 +599,7 @@ function damageWall(wall, amount) {
 // bullet just outside its exact collision radius after resolving.
 function checkWallBounceDamage(b, radius, bouncesBefore, damageAmount) {
     if (b.bounces <= bouncesBefore) return;
-    const effRadius = radius + WALL_T / 2 + 2;
+    const effRadius = radius + WALL_T / 2 + 2 * SC;
     for (const w of placedWalls) {
         if (circleRectCollide(b.x, b.y, effRadius, w.rect)) {
             damageWall(w, damageAmount);
@@ -567,7 +614,7 @@ function checkWallBounceDamage(b, radius, bouncesBefore, damageAmount) {
 function computeFrontTile(p) {
     const cosA = Math.cos(p.a), sinA = Math.sin(p.a);
     const maxD = TILE_SIZE * 6;
-    for (let d = 0; d < maxD; d += 8) {
+    for (let d = 0; d < maxD; d += 8 * SC) {
         const px = p.x + cosA * d, py = p.y + sinA * d;
         const col = Math.min(COLS - 1, Math.max(0, Math.floor((px - MARGIN_X) / CELL_W)));
         const row = Math.min(ROWS - 1, Math.max(0, Math.floor((py - MARGIN_Y) / CELL_H)));
@@ -755,15 +802,15 @@ function resolveBulletAgainstSegments(b, effRadius) {
         const dot = b.vx * nx + b.vy * ny;
         if (dot < -0.01) {
             // genuinely approaching this surface - real bounce
-            b.x += nx * (penetration + 0.1);
-            b.y += ny * (penetration + 0.1);
+            b.x += nx * (penetration + 0.1 * SC);
+            b.y += ny * (penetration + 0.1 * SC);
             b.vx -= 2 * dot * nx;
             b.vy -= 2 * dot * ny;
             bounced = true;
         } else {
             // grazing / already moving away - just stay clear, no reflection
-            b.x += nx * (penetration + 0.1);
-            b.y += ny * (penetration + 0.1);
+            b.x += nx * (penetration + 0.1 * SC);
+            b.y += ny * (penetration + 0.1 * SC);
         }
     }
     return bounced;
@@ -774,10 +821,30 @@ function resolveBulletAgainstSegments(b, effRadius) {
 // between one frame and the next (tunneling) - each sub-step is small enough
 // that the bullet is only ever touching a wall by a little bit when contact
 // is first detected, which keeps the reflection normal accurate.
+// Gradual water drag for regular bullets. Returns false when the bullet has lost >= 95% of
+// its original speed (it dies). Speed loss is permanent - it carries on after leaving the water.
+function applyWaterDrag(b, now) {
+    if (b.baseSpeed == null) { b.baseSpeed = Math.hypot(b.vx, b.vy); b.slow = 0; b.waterNext = null; }
+    if (!isWaterAt(b.x, b.y)) { b.waterNext = null; return true; }
+    if (b.waterNext == null) b.waterNext = now + WATER_DRAG_INTERVAL;
+    let changed = false;
+    while (now >= b.waterNext) {
+        b.waterNext += WATER_DRAG_INTERVAL;
+        b.slow += WATER_DRAG_STEP;
+        changed = true;
+    }
+    if (b.slow >= WATER_DRAG_DEATH - 1e-9) return false;
+    if (changed) {
+        const cur = Math.hypot(b.vx, b.vy);
+        if (cur > 0) { const k = b.baseSpeed * (1 - b.slow) / cur; b.vx *= k; b.vy *= k; }
+    }
+    return true;
+}
+
 function moveBulletWithBounce(b, radius, ignoreWater) {
     const effRadius = radius + WALL_T / 2; // walls are collided against their centerline
-    const SUBSTEPS = Math.max(4, Math.ceil(Math.hypot(b.vx, b.vy) / 3.5)); // faster bullets get more sub-steps
-    const wm = (!ignoreWater && isWaterAt(b.x, b.y)) ? WATER_BULLET_SPEED : 1; // bullets crawl through water
+    const SUBSTEPS = Math.max(4, Math.ceil(Math.hypot(b.vx, b.vy) / (3.5 * SC))); // faster bullets get more sub-steps
+    const wm = (!ignoreWater && b.type !== "normal" && isWaterAt(b.x, b.y)) ? WATER_BULLET_SPEED : 1; // regular bullets use applyWaterDrag instead // bullets crawl through water
     const stepX = b.vx * wm / SUBSTEPS, stepY = b.vy * wm / SUBSTEPS;
     let bouncedThisTick = false;
     for (let s = 0; s < SUBSTEPS; s++) {
@@ -799,31 +866,31 @@ const COLOR_NAMES = {
     "#fb8500": "Orange", "#8338ec": "Purple", "#ff5da2": "Pink", "#8d5524": "Brown"
 };
 const MAX_PLAYERS = 4;
-const TANK_RADIUS = 15;
-const BULLET_RADIUS = 4;
-const BULLET_SPEED = 7;
+let TANK_RADIUS = 15;
+let BULLET_RADIUS = 4;
+let BULLET_SPEED = 7;
 const SHOT_COOLDOWN = 1200;
 const MAX_BOUNCES = 20;
-const BASE_SPEED = 3.2;
+let BASE_SPEED = 3.2;
 const BASE_ROT = 0.055 * 1.15 * 1.10;
 
 const NITRO_DURATION = 20000, NITRO_MULT = 1.6;
 const LASER_CHARGE_TIME = 1500, LASER_VISUAL_TIME = 220, LASER_RANGE = 1600;
-const LASER_HALF_WIDTH = 11; // wide, easy-to-aim beam (~ a tank's width across)
+let LASER_HALF_WIDTH = 11; // wide, easy-to-aim beam (~ a tank's width across)
 
 const POWER_BEAM_SHOTS = 8; // shots granted per pickup - change this one number to rebalance
 const POWER_BEAM_RANGE = 1600;
-const POWER_BEAM_HALF_WIDTH = 6; // thin beam, much tighter than the regular laser
+let POWER_BEAM_HALF_WIDTH = 6; // thin beam, much tighter than the regular laser
 const POWER_BEAM_VISUAL_TIME = 200; // 0.2s
-const POWER_BEAM_KNOCKBACK = 8; // px the tank is shoved backward on each shot
+let POWER_BEAM_KNOCKBACK = 8; // px the tank is shoved backward on each shot
 
-const MG_RADIUS = BULLET_RADIUS * 0.6; // 40% smaller than a regular bullet
+let MG_RADIUS = BULLET_RADIUS * 0.6; // 40% smaller than a regular bullet
 const MG_SHOTS = 15; // bullets granted per pickup - change this one number to rebalance
 const SHOTGUN_SHOTS = 5; // volleys granted per pickup
 const SHOTGUN_SPREAD_DEG = 5; // side pellets are fired at +/- this angle
 const MG_SPREAD_DEG = 2; // each shot's angle is randomized by +/- this many degrees
 
-const TELEPORT_CURSOR_SPEED = 10; // px/tick the selection cursor moves while targeting (fast, ~3x tank speed)
+let TELEPORT_CURSOR_SPEED = 10; // px/tick the selection cursor moves while targeting (fast, ~3x tank speed)
 
 const STARBULLET_BURST_COUNT = 8; // regular bullets spawned when the star bullet is detonated mid-flight
 // time shield: held-space shield with 100 ammo. Blocks all damage except the "pierce" kinds
@@ -834,7 +901,7 @@ const TIMESHIELD_AMMO_PER_TICK = 1;
 const TIMESHIELD_PIERCE_MULT = 0.7; // 30% less damage from shock / airstrike / black hole
 
 // health orb: slow, huge, wall-ignoring projectile that heals whichever tank is closest to it
-const HEALORB_RADIUS = 4 * 3; // 300% of a regular bullet (BULLET_RADIUS = 4)
+let HEALORB_RADIUS = 4 * 3; // 300% of a regular bullet (BULLET_RADIUS = 4)
 const HEALORB_SPEED_MULT = 0.4; // of regular bullet speed
 const HEALORB_TICK = 150; // ms between heals
 const HEALORB_HP_PER_TICK = 1; // 1hp / 200ms = 5hp per second
@@ -847,24 +914,24 @@ const SUPERHEALTH_AMOUNT = 60; // HP every living player gets when someone picks
 
 const DRONE_SHOTS = 3; // shots the drone gets before it disappears
 const DRONE_SPEED_MULT = 0.6; // drone speed = BASE_SPEED * this
-const DRONE_SIZE = 22; // square side, same as the tank's shorter side
+let DRONE_SIZE = 22; // square side, same as the tank's shorter side
 const DRONE_MAX_BOUNCES = 4; // drone bullets only bounce this many times
 
 const CLEAN_ANIMATION_TIME = 1000; // 1s growing red wave; the actual wipe happens right as it finishes
 
-const AIRSTRIKE_CURSOR_SPEED = 10; // same fast cursor movement as teleport
+let AIRSTRIKE_CURSOR_SPEED = 10; // same fast cursor movement as teleport
 const AIRSTRIKE_FADE_TIME = 1000; // 1s tile fade-to-red; damage resolves the instant this ends
 const AIRSTRIKE_EXPLOSION_TIME = 500; // 0.5s explosion visual after the fade
 const AIRSTRIKE_DAMAGE = 90;
 
-const BOUNCE_LASER_SPEED = BULLET_SPEED * 4; // 4x a regular bullet
-const BOUNCE_LASER_RADIUS = 4; // thin beam - small collision radius for wall bounce physics
+let BOUNCE_LASER_SPEED = BULLET_SPEED * 4; // 4x a regular bullet
+let BOUNCE_LASER_RADIUS = 4; // thin beam - small collision radius for wall bounce physics
 const BOUNCE_LASER_MAX_BOUNCES = 10;
 const BOUNCE_LASER_DAMAGE = 60;
 
-const HACK_CURSOR_SPEED = 10; // same fast free-flying cursor speed as teleport/airstrike
+let HACK_CURSOR_SPEED = 10; // same fast free-flying cursor speed as teleport/airstrike
 const HACK_DURATION = 7000; // 7s of controlling the enemy tank - change this one number to adjust
-const SWAP_CURSOR_SPEED = 10;
+let SWAP_CURSOR_SPEED = 10;
 
 const FREEZE_DURATION = 13000; // 13s - change this one number to adjust
 const FREEZE_SPEED_MULT = 0.41; // movement & rotation speed while frozen (41% of normal)
@@ -904,7 +971,7 @@ const MAGNET_AMMO = 100; // ammo per magnet / antimagnet pickup
 const MAGNET_TICK = 40; // ms between ammo drains while the beam is held
 const MAGNET_AMMO_PER_TICK = 1;
 const MAGNET_RANGE = 1500; // longer than the arena diagonal
-const MAGNET_HALF_WIDTH = ((CELL_W + CELL_H) / 2) / 2; // beam is 1 tile thick
+let MAGNET_HALF_WIDTH = REF_TILE / 2; // beam is 1 tile thick
 const JOKER_COLS = 6; // columns in the joker picker grid (client lays the grid out with this)
 
 const MAX_HP = 100;const HEALTH_PACK_AMOUNT = 60;
@@ -945,27 +1012,61 @@ function applyDamage(pl, amount, attackerId, pierce) {
     if (pl.hp <= 0) pl.alive = false;
 }
 const HOMING_STRAIGHT_TIME = 2000, HOMING_CHASE_TIME = 10000;
-const HOMING_SPEED = BASE_SPEED * 1.02, HOMING_TURN_RATE = 0.08, HOMING_RADIUS = 5;
+let HOMING_SPEED = BASE_SPEED * 1.02, HOMING_RADIUS = 5; const HOMING_TURN_RATE = 0.08;
 
-const RC_SPEED = HOMING_SPEED * 1.3, RC_TURN_RATE = 0.12, RC_RADIUS = 6, RC_MAX_LIFETIME = 20000;
+let RC_SPEED = HOMING_SPEED * 1.3, RC_RADIUS = 6; const RC_TURN_RATE = 0.12, RC_MAX_LIFETIME = 20000;
 
-const ABOMB_RADIUS = BULLET_RADIUS * 2; // 200% scale bomb bullet
+let ABOMB_RADIUS = BULLET_RADIUS * 2; // 200% scale bomb bullet
 const ABOMB_FUSE_TIME = 8000; // explodes 8s after firing, regardless of bounces
-const TILE_SIZE = (CELL_W + CELL_H) / 2;
-const FLAME_MAX_LENGTH = TILE_SIZE * 3; // "3 tile long"
+let TILE_SIZE = REF_TILE; // fixed pixel length, independent of the current grid size
+let FLAME_MAX_LENGTH = TILE_SIZE * 3; // "3 tile long"
 const SHRAPNEL_COUNT = 8;
-const SHRAPNEL_MIN_DIST = TILE_SIZE * 0.5, SHRAPNEL_MAX_DIST = TILE_SIZE * 1.5;
+let SHRAPNEL_MIN_DIST = TILE_SIZE * 0.5, SHRAPNEL_MAX_DIST = TILE_SIZE * 1.5;
 const SHRAPNEL_BURST_TIME = 350; // ms to reach full distance
 const SHRAPNEL_TOTAL_LIFE = 900; // ms the debris stays deadly for (~1s explosion)
-const SHRAPNEL_RADIUS = 7; // collision radius of each shrapnel piece
+let SHRAPNEL_RADIUS = 7; // collision radius of each shrapnel piece
 
-const POWERUP_RADIUS = 10;
+let POWERUP_RADIUS = 10;
 const POWERUP_FIRST_DELAY = 4000, POWERUP_INTERVAL = 12500, POWERUP_EXPIRE = 60000;
-const POWERUP_MIN_GAP = 60; // don't spawn a new powerup this close to an existing one
-const POWERUP_MIN_PLAYER_DIST = TILE_SIZE * 3; // powerups must spawn at least 3 tiles from every tank
+let POWERUP_MIN_GAP = 60; // don't spawn a new powerup this close to an existing one
+let POWERUP_MIN_PLAYER_DIST = TILE_SIZE * 3; // powerups must spawn at least 3 tiles from every tank
 
 const ROUND_LONELY_TIME = 3000, ROUND_END_PAUSE = 2000;
 const WIN_SCORE = 10;
+
+// Recomputes every pixel-based gameplay constant from its classic (6x9) value times the
+// current grid's scale SC. Called by setGridSize() each time a new map size is picked.
+function applyScale() {
+    const S = SC;
+    WALL_T = 10 * S;
+    TANK_RADIUS = 15 * S;
+    BULLET_RADIUS = 4 * S;
+    BULLET_SPEED = 7 * S;
+    BASE_SPEED = 3.2 * S;
+    LASER_HALF_WIDTH = 11 * S;
+    POWER_BEAM_HALF_WIDTH = 6 * S;
+    POWER_BEAM_KNOCKBACK = 8 * S;
+    MG_RADIUS = BULLET_RADIUS * 0.6;
+    TELEPORT_CURSOR_SPEED = AIRSTRIKE_CURSOR_SPEED = HACK_CURSOR_SPEED = SWAP_CURSOR_SPEED = 10 * S;
+    HEALORB_RADIUS = 12 * S;
+    DRONE_SIZE = 22 * S;
+    BOUNCE_LASER_SPEED = BULLET_SPEED * 4;
+    BOUNCE_LASER_RADIUS = 4 * S;
+    HOMING_SPEED = BASE_SPEED * 1.02; HOMING_RADIUS = 5 * S;
+    RC_SPEED = HOMING_SPEED * 1.3; RC_RADIUS = 6 * S;
+    ABOMB_RADIUS = BULLET_RADIUS * 2;
+    TILE_SIZE = REF_TILE * S;
+    MAGNET_HALF_WIDTH = TILE_SIZE / 2;
+    FLAME_MAX_LENGTH = TILE_SIZE * 3;
+    SHRAPNEL_MIN_DIST = TILE_SIZE * 0.5; SHRAPNEL_MAX_DIST = TILE_SIZE * 1.5;
+    SHRAPNEL_RADIUS = 7 * S;
+    POWERUP_RADIUS = 10 * S;
+    POWERUP_MIN_GAP = 60 * S;
+    POWERUP_MIN_PLAYER_DIST = TILE_SIZE * 3;
+}
+CONSTS_READY = true;
+applyScale();
+applyMap(generateMaze()); // first (lobby) map - needs the scaled constants above
 
 // ---------- game state ----------
 let players = {};
@@ -1028,8 +1129,11 @@ function tileCenter(col, row) {
     return { x: MARGIN_X + (col + 0.5) * CELL_W, y: MARGIN_Y + (row + 0.5) * CELL_H };
 }
 function debugMaze() {
+    setGridSize(9, 6); // debug layout (powerup slots, dummy tile) is built for the classic grid
     const { hWalls, vWalls } = blankWalls(); // only the outer frame
-    return wallsToGeometry(hWalls, vWalls);
+    const geo = wallsToGeometry(hWalls, vWalls);
+    geo.cols = COLS; geo.rows = ROWS;
+    return geo;
 }
 function debugPlacePowerup(slot) {
     const pu = { id: nextPowerupId++, type: slot.type, x: slot.x, y: slot.y, expiresAt: Infinity };
@@ -1071,7 +1175,7 @@ function debugUpdate(now) {
         if (powerups.some(pu => pu.id === slot.puId)) continue;
         if (slot.respawnAt == null) { slot.respawnAt = now + DEBUG_POWERUP_RESTOCK; continue; }
         if (now < slot.respawnAt) continue;
-        if (playersArray().some(pl => pl.alive && Math.hypot(pl.x - slot.x, pl.y - slot.y) < TANK_RADIUS + POWERUP_RADIUS + 10)) continue;
+        if (playersArray().some(pl => pl.alive && Math.hypot(pl.x - slot.x, pl.y - slot.y) < TANK_RADIUS + POWERUP_RADIUS + 10 * SC)) continue;
         debugPlacePowerup(slot);
     }
 }
@@ -1353,7 +1457,7 @@ function spawnPowerup(now) {
 // that spawns already clipped through never gets the chance to bounce off
 // it). Doesn't touch the bounce physics itself, just clamps where a shot starts.
 function safeMuzzleDistance(p, desired, radius) {
-    const STEP = 3;
+    const STEP = 3 * SC;
     let dist = 0;
     while (dist < desired) {
         const next = Math.min(dist + STEP, desired);
@@ -1366,7 +1470,7 @@ function safeMuzzleDistance(p, desired, radius) {
 
 function fireBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "normal",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1387,7 +1491,7 @@ function fireShotgun(p, now) {
         statAdd(p, "statShots");
         const a = baseA + off;
         p.a = a; // safeMuzzleDistance measures along p.a
-        const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BULLET_RADIUS + WALL_T / 2);
+        const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
         p.a = baseA;
         bullets.push({
             id: nextBulletId++, type: "normal",
@@ -1402,7 +1506,7 @@ function fireMG(p, now) {
     statAdd(p, "statShots");
     const spread = (Math.random() * 2 - 1) * (MG_SPREAD_DEG * Math.PI / 180);
     const a = p.a + spread;
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, MG_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, MG_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "mg",
         x: p.x + Math.cos(a) * d, y: p.y + Math.sin(a) * d,
@@ -1416,7 +1520,7 @@ function fireMG(p, now) {
 // auto-fire as fireBullet (not a single edge-triggered shot like MG/beam).
 function fireSuperBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "superbullet",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1441,7 +1545,7 @@ function fireHealthOrb(p, now) {
 // like a normal one. Pressing space again while it is alive calls burstStarBullet.
 function fireStarBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     const id = nextBulletId++;
     bullets.push({
         id, type: "starbullet",
@@ -1473,7 +1577,7 @@ function burstStarBullet(b) {
 function fireFastBullet(p, now) {
     statAdd(p, "statShots");
     const spd = BULLET_SPEED * FASTBULLET_SPEED_MULT;
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "fastbullet",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1521,7 +1625,7 @@ function endDrone(p) {
 // since it needs a growing polyline, not a single point.
 function fireBouncingLaser(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, BOUNCE_LASER_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BOUNCE_LASER_RADIUS + WALL_T / 2);
     const startX = p.x + Math.cos(p.a) * d, startY = p.y + Math.sin(p.a) * d;
     bounceLasers.push({
         id: nextBounceLaserId++,
@@ -1676,7 +1780,7 @@ function triggerBlackHole(p, now) {
 
 function fireHoming(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, HOMING_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, HOMING_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "homing",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1687,7 +1791,7 @@ function fireHoming(p, now) {
 
 function fireRC(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, RC_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, RC_RADIUS + WALL_T / 2);
     const rid = nextBulletId++;
     bullets.push({
         id: rid, type: "rc",
@@ -1699,7 +1803,7 @@ function fireRC(p, now) {
 
 function fireAbomb(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6, ABOMB_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, ABOMB_RADIUS + WALL_T / 2);
     const id = nextBulletId++;
     bullets.push({
         id, type: "abomb",
@@ -1851,7 +1955,7 @@ function runMagnets(now, timeStopped) {
         }
         p.magnetActive = true;
         const cx = Math.cos(p.a), cy = Math.sin(p.a);
-        beams.push({ p, cx, cy, ox: p.x + cx * (TANK_RADIUS + 7), oy: p.y + cy * (TANK_RADIUS + 7), push: p.powerup === "antimagnet" });
+        beams.push({ p, cx, cy, ox: p.x + cx * (TANK_RADIUS + 7 * SC), oy: p.y + cy * (TANK_RADIUS + 7 * SC), push: p.powerup === "antimagnet" });
     }
     if (beams.length === 0) return;
 
@@ -1902,7 +2006,7 @@ function runMagnets(now, timeStopped) {
     }
 
     for (const b of bullets) {
-        const bm = find(b.x, b.y, 4);
+        const bm = find(b.x, b.y, 4 * SC);
         if (!bm) continue;
         const d = dirFrom(bm, b.x, b.y);
         if (!d) continue;
@@ -2677,6 +2781,7 @@ function updateRound(now, realNow) {
 
         // normal / machine-gun / super bullet (same physics; MG is smaller, super bullet hits harder)
         const bRadius = b.type === "mg" ? MG_RADIUS : BULLET_RADIUS;
+        if (b.type === "normal" && !applyWaterDrag(b, now)) continue; // sank: slowed down 95%+
         const bBouncesBefore = b.bounces;
         moveBulletWithBounce(b, bRadius);
         checkWallBounceDamage(b, bRadius, bBouncesBefore, DAMAGE[b.type] || DAMAGE.bullet);
@@ -3136,6 +3241,7 @@ function broadcastState(now) {
             powerups,
             lasers: lasers.map(l => ({ x1: l.x1, y1: l.y1, x2: l.x2, y2: l.y2, color: l.color, kind: l.kind || "laser" })),
             maze: mazeWalls,
+            cols: COLS, rows: ROWS, scale: SC,
             solidBlocks: solidBlocks.map(b => ({ col: b.col, row: b.row })),
             water: waterGrid,
             mapType,
