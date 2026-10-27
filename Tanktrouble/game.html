@@ -5,7 +5,7 @@ html,body{margin:0;height:100%;background:#111;color:#eee;font-family:Arial,sans
 #wrap{display:flex;flex-direction:column;align-items:center;height:100%}
 #top{height:58px;display:flex;align-items:center;gap:18px;font-size:14px;flex-wrap:wrap}
 #status{font-weight:bold}
-canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max-height:calc(100vh - 100px);image-rendering:auto}
+canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max-height:calc(100vh - 150px);image-rendering:auto}
 #help{position:fixed;left:10px;bottom:8px;color:#aaa;font-size:12px}
 #scores{display:flex;gap:10px;font-size:13px}
 .score{padding:2px 8px;border-radius:4px;background:#222}
@@ -33,6 +33,19 @@ canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max
 .readyRow.isReady{box-shadow:inset 0 0 0 1px #7cff8a}
 .readyRow.isReady .readyState{color:#7cff8a}
 #canvasWrap{position:relative}
+#chatBar{position:fixed;left:50%;bottom:6px;transform:translateX(-50%);display:none;align-items:center;gap:10px;
+  background:rgba(20,20,20,.95);border:1px solid #666;border-radius:6px;padding:4px 10px;z-index:6}
+#chatBox{font:14px/16px monospace;color:#fff;white-space:pre;width:11ch;min-height:48px}
+#chatBox div{height:16px}
+#chatBox .caret{display:inline-block;width:1ch;animation:chatBlink 1s steps(1) infinite}
+@keyframes chatBlink{50%{opacity:0}}
+#chatInfo{font-size:11px;color:#aaa;line-height:15px}
+#lobbyChat{position:absolute;left:10px;top:10px;bottom:10px;width:150px;display:none;flex-direction:column;gap:6px;
+  overflow:hidden;z-index:3;pointer-events:none;font-family:monospace;
+  -webkit-mask-image:linear-gradient(to bottom,#000 88%,transparent);mask-image:linear-gradient(to bottom,#000 88%,transparent)}
+.lcMsg{flex:none;background:rgba(20,20,20,.82);border-left:4px solid #888;border-radius:5px;padding:3px 8px;font-size:13px;line-height:16px}
+.lcName{font-weight:bold;color:#fff}
+.lcText{white-space:pre;color:#ddd}
 #pauseOverlay{position:absolute;inset:0;display:none;align-items:center;justify-content:center;
   background:rgba(0,0,0,.45);color:#fff;font-size:26px;font-weight:bold;font-family:Arial,sans-serif;z-index:4}
 </style></head>
@@ -44,13 +57,15 @@ canvas{background:#e8e8e8;border:2px solid #555;max-width:calc(100vw - 20px);max
   <h3>Set up your tank</h3>
   <div id="colorRow"></div>
   <input id="nameInput" maxlength="6" placeholder="NAME">
-  <div id="lobbyHint">Type a name (required), press Enter to confirm, pick a free color, then press R when ready</div>
+  <div id="lobbyHint">Type a name (required), press Enter to confirm, pick a free color, then press R when ready. Press C to chat</div>
   <div id="readyList"></div>
 </div>
+<div id="lobbyChat"></div>
 <div id="pauseOverlay">PAUSED</div>
 </div>
 </div>
-<div id="help">Move: WASD / Arrows &nbsp; Fire/Use: Space &nbsp; R = ready/start &nbsp; P = host pause &nbsp; Grab boxes on the map for Nitro (yellow), Laser (blue), Homing Missile (red), Shield (green), RC Rocket (purple), A-Bomb (brown), Power Beam (pink), Machine Gun (teal), Health Pack (green +), Teleport (light blue), Super Bullet (indigo), Clean (dark red), Airstrike (black), Ghost (slate gray), Bouncing Laser (amber), Hacking (neon green), Freeze (light blue), Black Hole (white), Flamethrower (neon red), Wall (stone gray), Slide (dark oily brown), Cannon Cap (red), Clone (cyan), Shock (yellow), Darkness (dark brown), Time Stop (amber), Swap (olive), Fast Bullet (pink), Super Health (gold +), Drone (light red), Safetile (light green), Joker (white/gold), Magnet (white), Antimagnet (dark blue), Slot Machine (red, ???), Shotgun (white, 3 dots), Star Bullet (white, 9 dots), Time Shield (light blue, clock), Health Orb (green +)</div>
+<div id="chatBar"><div id="chatBox"></div><div id="chatInfo"><span id="chatCount">0/30</span><br>Enter: send<br>C: cancel</div></div>
+<div id="help">Move: WASD / Arrows &nbsp; Fire/Use: Space &nbsp; R = ready/start &nbsp; P = host pause &nbsp; Grab boxes on the map for Nitro (yellow), Laser (blue), Homing Missile (red), Shield (green), RC Rocket (purple), A-Bomb (brown), Power Beam (pink), Machine Gun (teal), Health Pack (green +), Teleport (light blue), Super Bullet (indigo), Clean (dark red), Airstrike (black), Ghost (slate gray), Bouncing Laser (amber), Hacking (neon green), Freeze (light blue), Black Hole (white), Flamethrower (neon red), Wall (stone gray), Slide (dark oily brown), Cannon Cap (red), Clone (cyan), Shock (yellow), Darkness (dark brown), Time Stop (amber), Swap (olive), Fast Bullet (pink), Super Health (gold +), Drone (light red), Safetile (light green), Joker (white/gold), Magnet (white), Antimagnet (dark blue), Slot Machine (red, ???), Shotgun (white, 3 dots), Star Bullet (white, 9 dots), Time Shield (light blue, clock), Health Orb (green +), Bot (black, robot head). Lobby: hold N + M for 3 seconds to become the host</div>
 <script>
 const canvas=document.getElementById('game'),ctx=canvas.getContext('2d');
 const statusEl=document.getElementById('status'),playersEl=document.getElementById('players'),scoresEl=document.getElementById('scores');
@@ -115,9 +130,85 @@ let framesReady=[false,false];
 tankFrames[0].onload=()=>framesReady[0]=true;
 tankFrames[1].onload=()=>framesReady[1]=true;
 
+// ---- chat ----
+// C opens/closes the chat box (closing throws the text away), Enter sends and closes.
+// 30 characters max, shown as 3 lines of 10 (long words are simply split). The tank is frozen while the box is open.
+const CHAT_MAX=30, CHAT_LINE=10;
+const CHAT_SHOW_MS=4000, CHAT_FADE_MS=700; // keep in sync with the server
+const chatBar=document.getElementById('chatBar'),chatBox=document.getElementById('chatBox'),chatCount=document.getElementById('chatCount');
+const lobbyChatEl=document.getElementById('lobbyChat');
+let chatOpen=false, chatText='';
+function chatLines(text){ // split into rows of 10 characters
+  const ch=Array.from(text), out=[];
+  for(let i=0;i<ch.length;i+=CHAT_LINE) out.push(ch.slice(i,i+CHAT_LINE).join(''));
+  return out;
+}
+function chatMode(){ // which kind of chat works right now (null = none)
+  if(myId==null) return null;
+  const ph=state.gamePhase;
+  if(ph==='lobby') return 'lobby';
+  if(ph==='round'||ph==='roundend'){ const me=state.players[myId]; return (me&&me.alive)?'game':null; }
+  return null;
+}
+function drawChatBox(){
+  const lines=chatLines(chatText), len=Array.from(chatText).length;
+  chatBox.innerHTML='';
+  for(let i=0;i<CHAT_MAX/CHAT_LINE;i++){
+    const row=document.createElement('div');
+    row.appendChild(document.createTextNode(lines[i]||''));
+    if(len<CHAT_MAX && i===Math.floor(len/CHAT_LINE)){ const c=document.createElement('span'); c.className='caret'; c.textContent='\u258c'; row.appendChild(c); }
+    chatBox.appendChild(row);
+  }
+  chatCount.textContent=len+'/'+CHAT_MAX;
+}
+function openChat(){
+  chatOpen=true; chatText='';
+  for(const k in keys) keys[k]=false; // let go of everything - the tank stops
+  chatBar.style.display='flex'; drawChatBox();
+}
+function closeChat(){ chatOpen=false; chatText=''; chatBar.style.display='none'; }
+function chatKey(e){
+  if(e.key==='Enter'){
+    e.preventDefault(); if(e.repeat) return;
+    const t=chatText.trim();
+    if(t) send({type:'chat',text:t});
+    closeChat(); return;
+  }
+  if(e.key==='Backspace'){ e.preventDefault(); chatText=Array.from(chatText).slice(0,-1).join(''); drawChatBox(); return; }
+  if(e.ctrlKey||e.metaKey||e.altKey) return;
+  if(Array.from(e.key).length===1){ // a typed character (plain C is the close key, so Shift+C types a capital C)
+    e.preventDefault();
+    if(Array.from(chatText).length<CHAT_MAX){ chatText+=e.key; drawChatBox(); }
+  }
+}
+function renderLobbyChat(){
+  const show=state.gamePhase==='lobby' && myId!=null;
+  lobbyChatEl.style.display=show?'flex':'none';
+  if(!show) return;
+  const list=state.lobbyChat||[], sig=JSON.stringify(list);
+  if(sig===lobbyChatSig) return;
+  lobbyChatSig=sig; lobbyChatEl.innerHTML='';
+  for(const m of list){ // newest first = top
+    const live=state.players[m.id];
+    const box=document.createElement('div'); box.className='lcMsg';
+    box.style.borderLeftColor=(live&&live.color)||m.color;
+    const nm=document.createElement('div'); nm.className='lcName'; nm.textContent=m.name+':';
+    const tx=document.createElement('div'); tx.className='lcText'; tx.textContent=chatLines(m.text).join('\n');
+    box.append(nm,tx); lobbyChatEl.appendChild(box);
+  }
+}
+let lobbyChatSig='';
+
 const keys={};
 addEventListener('keydown',e=>{
   if(document.activeElement===nameInput) return; // typing a name shouldn't trigger game keys
+  if(e.code==='KeyC' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey){ // chat toggle
+    e.preventDefault();
+    if(e.repeat) return;
+    if(chatOpen) closeChat(); else if(chatMode()) openChat();
+    return;
+  }
+  if(chatOpen){ chatKey(e); return; } // while chatting nothing else reaches the game
   keys[e.code]=true;
   if(['Space','KeyW','KeyA','KeyS','KeyD','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code)) e.preventDefault();
   if(e.code==='KeyR'){
@@ -134,6 +225,17 @@ addEventListener('keydown',e=>{
   if((e.code==='Digit9'||e.code==='Numpad9') && state.gamePhase==='round' && state.hostId===myId) send({type:'selfdestruct'}); // host self-destruct
 });
 addEventListener('keyup',e=>{ if(document.activeElement!==nameInput) keys[e.code]=false; });
+addEventListener('blur',()=>{ for(const k in keys) keys[k]=false; });
+// lobby: holding N and M together for 3 seconds makes you the host
+let hostHoldStart=null, hostHoldSent=false;
+function hostHoldProgress(now){
+  const holding=state.gamePhase==='lobby' && keys.KeyN && keys.KeyM && state.hostId!==myId;
+  if(!holding){ hostHoldStart=null; hostHoldSent=false; return null; }
+  if(hostHoldStart==null) hostHoldStart=now;
+  const t=(now-hostHoldStart)/3000;
+  if(t>=1 && !hostHoldSent){ hostHoldSent=true; send({type:'claimhost'}); }
+  return Math.min(1,t);
+}
 resetBtn.onclick=()=>send({type:'reset'});
 
 nameInput.addEventListener('input',()=>{
@@ -237,6 +339,8 @@ function handleMessage(e){
       }
 
       state=m.state;
+      if(chatOpen && !chatMode()) closeChat(); // died / game over while typing
+      renderLobbyChat();
       applyGridSize(m.state.cols,m.state.rows,m.state.scale);
       if(m.state.maze) maze=m.state.maze;
 
@@ -298,6 +402,7 @@ function handleMessage(e){
 function send(o){ if(ws&&ws.readyState===1) ws.send(JSON.stringify(o)); }
 
 function controls(){
+  if(chatOpen) return {up:false,down:false,left:false,right:false,shoot:false};
   return {
     up: !!(keys.KeyW||keys.ArrowUp), down: !!(keys.KeyS||keys.ArrowDown),
     left: !!(keys.KeyA||keys.ArrowLeft), right: !!(keys.KeyD||keys.ArrowRight),
@@ -460,8 +565,22 @@ const POWERUP_BOX_COLORS = {
   shotgun: '#ffffff',      // white
   starbullet: '#ffffff',   // white
   timeshield: '#a5d8ff',   // light blue
-  healthorb: '#22c55e'     // green
+  healthorb: '#22c55e',    // green
+  bot: '#000000',          // black
+  shrink: '#ffe600',       // bright yellow
+  nuke: '#ffe600'          // bright yellow
 };
+function drawTrefoil(cx,cy,R){
+  const r0=R*0.3;
+  for(let k=0;k<3;k++){
+    const a=-Math.PI/2+k*2*Math.PI/3;
+    ctx.beginPath();
+    ctx.arc(cx,cy,R,a-Math.PI/6,a+Math.PI/6);
+    ctx.arc(cx,cy,r0,a+Math.PI/6,a-Math.PI/6,true);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.beginPath(); ctx.arc(cx,cy,R*0.17,0,Math.PI*2); ctx.fill();
+}
 function drawPowerupIcon(pu){
   const s=14;
   ctx.save();
@@ -472,7 +591,7 @@ function drawPowerupIcon(pu){
   ctx.lineWidth=1;
   ctx.fillRect(-s/2,-s/2,s,s);
   ctx.strokeRect(-s/2,-s/2,s,s);
-  const iconColor=(pu.type==='freeze'||pu.type==='blackhole'||pu.type==='flamethrower'||pu.type==='slide'||pu.type==='clone'||pu.type==='shock'||pu.type==='timestop'||pu.type==='swap'||pu.type==='fastbullet'||pu.type==='drone'||pu.type==='shotgun'||pu.type==='starbullet')?'#000':'#fff'; // these keep their glyph black
+  const iconColor=(pu.type==='freeze'||pu.type==='blackhole'||pu.type==='flamethrower'||pu.type==='slide'||pu.type==='clone'||pu.type==='shock'||pu.type==='timestop'||pu.type==='swap'||pu.type==='fastbullet'||pu.type==='drone'||pu.type==='shotgun'||pu.type==='starbullet'||pu.type==='shrink'||pu.type==='nuke')?'#000':'#fff'; // these keep their glyph black
   ctx.fillStyle=iconColor;
   ctx.strokeStyle=iconColor;
   if(pu.type==='nitro'){
@@ -652,6 +771,26 @@ function drawPowerupIcon(pu){
     ctx.lineTo(-1,-4);
     ctx.closePath();
     ctx.fillStyle='#fff'; ctx.fill();
+  } else if(pu.type==='nuke'){
+    drawTrefoil(0,0,5.6);
+  } else if(pu.type==='shrink'){
+    // three black bars, left to right: big, medium, tiny
+    ctx.fillRect(-5.8,-4.5,3.6,9);
+    ctx.fillRect(-1.2,-2.6,2.6,5.2);
+    ctx.fillRect(3.3,-1,2,2);
+  } else if(pu.type==='bot'){
+    // minimal light-gray robot head: antenna, rounded head, two eyes, small ear bolts
+    const g='#d1d5db';
+    ctx.strokeStyle=g; ctx.lineWidth=1; ctx.lineCap='round';
+    ctx.beginPath(); ctx.moveTo(0,-3.2); ctx.lineTo(0,-5.4); ctx.stroke();
+    ctx.fillStyle=g;
+    ctx.beginPath(); ctx.arc(0,-5.9,0.9,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.roundRect(-4.4,-3.2,8.8,7.4,1.8); ctx.fill();
+    ctx.fillRect(-5.6,-0.8,1.2,2.6); ctx.fillRect(4.4,-0.8,1.2,2.6);
+    ctx.fillStyle='#000';
+    ctx.beginPath(); ctx.arc(-1.8,-0.6,1,0,Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(1.8,-0.6,1,0,Math.PI*2); ctx.fill();
+    ctx.fillRect(-2,2,4,0.9);
   } else if(pu.type==='ghost'){
     // simple minimal ghost silhouette: rounded head, wavy skirt, two eyes
     ctx.beginPath();
@@ -982,6 +1121,15 @@ function render(){
     ctx.strokeRect(tileX+1,tileY+1,GRID_CELL_W-2,GRID_CELL_H-2);
   }
 
+  // nuke bombs: cosmetic (tanks drive over them). Black disc, dark red inner disc, yellow radioactivity symbol.
+  for(const n of state.nukes||[]){
+    if(n.exploded) continue;
+    const bx=GRID_MARGIN_X+(n.col+0.5)*GRID_CELL_W, by=GRID_MARGIN_Y+(n.row+0.5)*GRID_CELL_H;
+    ctx.fillStyle='#000'; ctx.beginPath(); ctx.arc(bx,by,15*SC,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#7a0c0c'; ctx.beginPath(); ctx.arc(bx,by,11.5*SC,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle='#ffe600'; drawTrefoil(bx,by,8.5*SC);
+  }
+
   // safetiles: translucent green zones (tanks drive through them, see server rules)
   for(const st of state.safeTiles||[]){
     const tx=GRID_MARGIN_X+st.col*GRID_CELL_W, ty=GRID_MARGIN_Y+st.row*GRID_CELL_H;
@@ -1044,10 +1192,11 @@ function render(){
     const segments=20; // tripled+ so circles overlap along the full length instead of leaving gaps
     for(let i=0;i<segments;i++){
       const t=(i+0.5)/segments;
-      const dist=15*SC+t*p.flameLen; // 15 ~= tank radius, so it starts at the tank's edge
+      const sm=p.sizeMult||1;
+      const dist=15*SC*sm+t*p.flameLen; // 15 ~= tank radius, so it starts at the tank's edge
       const flicker=0.7+0.3*Math.sin(flameClockNow/60+i*1.7+p.x*0.01);
       const segX=p.x+cosA*dist, segY=p.y+sinA*dist;
-      const w=(1-t*0.5)*13*SC*flicker;
+      const w=(1-t*0.5)*13*SC*flicker*sm;
       ctx.save();
       ctx.globalAlpha=0.85*(1-t*0.3);
       ctx.fillStyle=i%2===0?'#ff6a00':'#ff2d00';
@@ -1066,7 +1215,8 @@ function render(){
     const col=anti?'#ff8c1a':'#4f8cff';
     const tile=GRID_REF_TILE*SC;
     const cs=Math.cos(p.a), sn=Math.sin(p.a);
-    const sx=p.x+cs*22*SC, sy=p.y+sn*22*SC, ex=sx+cs*1500, ey=sy+sn*1500;
+    const mr=(15*(p.sizeMult||1)+7)*SC;
+    const sx=p.x+cs*mr, sy=p.y+sn*mr, ex=sx+cs*1500, ey=sy+sn*1500;
     ctx.save();
     ctx.lineCap='butt';
     ctx.globalAlpha=0.22; ctx.strokeStyle=col; ctx.lineWidth=tile;
@@ -1310,7 +1460,9 @@ function render(){
     ctx.save();
     ctx.translate(p.x,p.y); ctx.scale(SC,SC); ctx.translate(-p.x,-p.y);
     if(p.ghosted) ctx.globalAlpha=0.5; // the pilot still sees their own tank, just translucent
-    if(p.isClone) ctx.globalAlpha=(ctx.globalAlpha||1)*0.55; // clones read as copies
+    if(p.isClone && !p.isBot) ctx.globalAlpha=(ctx.globalAlpha||1)*0.55; // clones read as copies (bots stay solid)
+    const sm=p.sizeMult||1, lo=15*(1-sm); // shrink powerup: body drawn smaller, labels move down to stay next to it
+    ctx.save(); ctx.translate(p.x,p.y); ctx.scale(sm,sm); ctx.translate(-p.x,-p.y);
     if(p.glow){
       ctx.save();
       ctx.globalAlpha=0.35;
@@ -1387,29 +1539,31 @@ function render(){
       ctx.restore();
     }
 
+    ctx.restore(); // end of the shrink-scaled body block
     ctx.fillStyle='#111'; ctx.font=Math.max(11,9/SC)+'px Arial'; ctx.textAlign='center';
     const label=p.name?p.name:('P'+id);
-    ctx.fillText(label + (id==myControlledId()?' (you)':''), p.x, p.y-26);
+    ctx.fillText(label + (id==myControlledId()?' (you)':''), p.x, p.y-26+lo);
 
     const SHOTS_LEFT_MAP={powerbeam:'powerBeamShots', mg:'mgShots', shotgun:'shotgunShots', superbullet:'superBulletShots', timeshield:'timeShieldAmmo', fastbullet:'fastBulletShots', blackhole:'blackHoleShots', flamethrower:'flameFuel', wall:'wallShots', water:'waterShots', magnet:'magnetAmmo', antimagnet:'magnetAmmo'};
     const shotsField=SHOTS_LEFT_MAP[p.powerup];
     if(shotsField && p[shotsField]>0){
       ctx.fillStyle='#e63946'; ctx.font='bold '+Math.max(15,11/SC)+'px Arial';
-      ctx.fillText(String(p[shotsField]), p.x, p.y-40);
+      ctx.fillText(String(p[shotsField]), p.x, p.y-40+lo);
     } else if(p.hacking && p.hackSecondsLeft>0){
       ctx.fillStyle='#e63946'; ctx.font='bold '+Math.max(15,11/SC)+'px Arial';
-      ctx.fillText(String(p.hackSecondsLeft), p.x, p.y-40);
+      ctx.fillText(String(p.hackSecondsLeft), p.x, p.y-40+lo);
     }
 
     if(p.alive){
       const hp=p.hp!=null?p.hp:100;
-      const barW=28, barH=4, barY=p.y-19;
-      const frac=Math.max(0,Math.min(1,hp/100));
+      const barW=28*Math.max(sm,0.6), barH=4, barY=p.y-19+lo;
+      const maxHp=p.maxHp||100;
+      const frac=Math.max(0,Math.min(1,hp/maxHp));
       ctx.fillStyle='rgba(0,0,0,0.35)';
       ctx.fillRect(p.x-barW/2-1, barY-1, barW+2, barH+2);
       ctx.fillStyle='#333';
       ctx.fillRect(p.x-barW/2, barY, barW, barH);
-      ctx.fillStyle = hp<30 ? '#e63946' : hp<50 ? '#fb8500' : '#22c55e';
+      ctx.fillStyle = frac<0.3 ? '#e63946' : frac<0.5 ? '#fb8500' : '#22c55e';
       ctx.fillRect(p.x-barW/2, barY, barW*frac, barH);
     }
     if(p.waterLeft!=null){
@@ -1417,17 +1571,77 @@ function render(){
       const secs=Math.ceil(p.waterLeft), draining=p.waterLeft<=0;
       ctx.textAlign='center';
       ctx.fillStyle=draining?'rgba(200,30,30,0.9)':'rgba(30,100,210,0.9)';
-      ctx.beginPath(); ctx.arc(p.x,p.y-54,11,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.arc(p.x,p.y-54+lo,11,0,Math.PI*2); ctx.fill();
       ctx.fillStyle='#fff'; ctx.font='bold '+Math.max(13,10/SC)+'px Arial'; ctx.textBaseline='middle';
-      ctx.fillText(draining?'!':String(secs),p.x,p.y-54);
+      ctx.fillText(draining?'!':String(secs),p.x,p.y-54+lo);
       ctx.textBaseline='alphabetic';
     }
     if(p.timeShieldActive){
       // translucent blue bubble so everyone can see the time shield is up
       ctx.fillStyle='rgba(59,130,246,0.30)';
       ctx.strokeStyle='rgba(30,64,175,0.7)'; ctx.lineWidth=2;
-      ctx.beginPath(); ctx.arc(p.x,p.y,24,0,Math.PI*2); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.arc(p.x,p.y,24*sm,0,Math.PI*2); ctx.fill(); ctx.stroke();
     }
+    ctx.restore();
+  }
+
+  // nuke: countdown above the bomb (everyone sees it), then the 0.5s blast over the 3x3 tiles around it
+  for(const n of state.nukes||[]){
+    const bx=GRID_MARGIN_X+(n.col+0.5)*GRID_CELL_W, by=GRID_MARGIN_Y+(n.row+0.5)*GRID_CELL_H;
+    if(!n.exploded){
+      const secs=Math.max(1,Math.min(5,Math.ceil((n.explodeAt-simClock())/1000)));
+      ctx.save();
+      ctx.font='bold '+Math.round(Math.max(16,20*SC))+'px Arial'; ctx.textAlign='center'; ctx.textBaseline='bottom';
+      ctx.lineWidth=4; ctx.strokeStyle='#000'; ctx.strokeText(String(secs),bx,by-17*SC);
+      ctx.fillStyle='#ffe600'; ctx.fillText(String(secs),bx,by-17*SC);
+      ctx.restore();
+      continue;
+    }
+    const t=Math.max(0,Math.min(1,(simClock()-n.explodeAt)/500));
+    const c0=Math.max(0,n.col-1), c1=Math.min(GRID_COLS-1,n.col+1), r0=Math.max(0,n.row-1), r1=Math.min(GRID_ROWS-1,n.row+1);
+    const ax=GRID_MARGIN_X+c0*GRID_CELL_W, ay=GRID_MARGIN_Y+r0*GRID_CELL_H, aw=(c1-c0+1)*GRID_CELL_W, ah=(r1-r0+1)*GRID_CELL_H;
+    ctx.save();
+    ctx.beginPath(); ctx.rect(ax,ay,aw,ah); ctx.clip(); // the blast stays inside the 3x3 block
+    const R=Math.hypot(GRID_CELL_W,GRID_CELL_H)*1.55*(0.25+0.75*Math.sqrt(t));
+    const fade=1-t;
+    const g=ctx.createRadialGradient(bx,by,0,bx,by,R);
+    g.addColorStop(0,`rgba(255,255,230,${(0.95*fade).toFixed(3)})`);
+    g.addColorStop(0.35,`rgba(255,210,60,${(0.85*fade).toFixed(3)})`);
+    g.addColorStop(0.75,`rgba(255,90,20,${(0.6*fade).toFixed(3)})`);
+    g.addColorStop(1,'rgba(120,20,0,0)');
+    ctx.fillStyle=g; ctx.fillRect(ax,ay,aw,ah);
+    ctx.fillStyle=`rgba(255,240,200,${(0.5*Math.max(0,1-t*3)).toFixed(3)})`; ctx.fillRect(ax,ay,aw,ah); // opening flash
+    ctx.strokeStyle=`rgba(255,255,255,${(0.8*fade).toFixed(3)})`; ctx.lineWidth=4*SC+2;
+    ctx.beginPath(); ctx.arc(bx,by,R*0.9,0,Math.PI*2); ctx.stroke(); // shockwave ring
+    ctx.restore();
+  }
+
+  // chat bubbles: translucent white bubble with translucent black text above the name/ammo, follows the tank
+  for(const [id,p] of Object.entries(state.players||{})){
+    if(!p.alive || !p.chat || p.isClone) continue;
+    if(p.ghosted && id!=myControlledId()) continue;
+    const age=p.chat.age;
+    const a=age<=CHAT_SHOW_MS ? 1 : 1-(age-CHAT_SHOW_MS)/CHAT_FADE_MS;
+    if(a<=0) continue;
+    const lines=chatLines(p.chat.text);
+    ctx.save();
+    ctx.globalAlpha=a;
+    ctx.font='bold 13px Arial'; ctx.textAlign='center'; ctx.textBaseline='middle';
+    const lh=15, padX=7, padY=5;
+    let tw=0; for(const l of lines) tw=Math.max(tw,ctx.measureText(l).width);
+    const bw=tw+padX*2, bh=lines.length*lh+padY*2, tail=6;
+    const bx=Math.max(2,Math.min(W-bw-2,p.x-bw/2));
+    const bottom=p.y-((p.waterLeft!=null?72:60)-15*(1-(p.sizeMult||1)))*SC-tail;
+    const by=Math.max(2,bottom-bh);
+    ctx.fillStyle='rgba(255,255,255,0.72)';
+    ctx.beginPath();
+    const r=6, x0=bx, y0=by, x1=bx+bw, y1=by+bh;
+    ctx.moveTo(x0+r,y0); ctx.arcTo(x1,y0,x1,y1,r); ctx.arcTo(x1,y1,x0,y1,r); ctx.arcTo(x0,y1,x0,y0,r); ctx.arcTo(x0,y0,x1,y0,r);
+    ctx.closePath(); ctx.fill();
+    const tx=Math.max(x0+r+3,Math.min(x1-r-3,p.x)); // little tail pointing at the tank
+    ctx.beginPath(); ctx.moveTo(tx-5,y1-0.5); ctx.lineTo(tx+5,y1-0.5); ctx.lineTo(tx,y1+tail); ctx.closePath(); ctx.fill();
+    ctx.fillStyle='rgba(0,0,0,0.7)';
+    lines.forEach((l,i)=>ctx.fillText(l,bx+bw/2,by+padY+lh*i+lh/2));
     ctx.restore();
   }
 
@@ -1702,7 +1916,14 @@ function render(){
     ctx.fillStyle='#111'; ctx.textAlign='center';
     ctx.font='bold 32px Arial';
     ctx.fillText('Tank Trouble LAN', W/2, 70);
-    ctx.font='18px Arial';
+    const hh=hostHoldProgress(performance.now());
+    if(hh!=null){
+      ctx.fillStyle='#111'; ctx.font='bold 16px Arial';
+      ctx.fillText(hh>=1?'You are now the host!':'Keep holding N + M to become the host...', W/2, H-60);
+      ctx.fillStyle='rgba(0,0,0,0.15)'; ctx.fillRect(W/2-120,H-48,240,10);
+      ctx.fillStyle='#2563eb'; ctx.fillRect(W/2-120,H-48,240*hh,10);
+    }
+    ctx.fillStyle='#111'; ctx.font='18px Arial';
     const players=Object.entries(state.players||{});
     if(players.length===0){
       ctx.fillText('Waiting for players to connect...', W/2, 104);

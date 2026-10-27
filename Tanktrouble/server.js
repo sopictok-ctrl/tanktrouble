@@ -564,8 +564,8 @@ function inFlameCone(p, targetX, targetY, targetRadius, length) {
     const dx = targetX - p.x, dy = targetY - p.y;
     const localX = dx * cosA + dy * sinA;
     const localY = -dx * sinA + dy * cosA;
-    const halfWidth = TANK_RADIUS;
-    const closestX = Math.max(TANK_RADIUS, Math.min(localX, TANK_RADIUS + length));
+    const halfWidth = tankR(p);
+    const closestX = Math.max(tankR(p), Math.min(localX, tankR(p) + length));
     const closestY = Math.max(-halfWidth, Math.min(localY, halfWidth));
     const ddx = localX - closestX, ddy = localY - closestY;
     return (ddx * ddx + ddy * ddy) < targetRadius * targetRadius;
@@ -618,7 +618,7 @@ function computeFrontTile(p) {
         const px = p.x + cosA * d, py = p.y + sinA * d;
         const col = Math.min(COLS - 1, Math.max(0, Math.floor((px - MARGIN_X) / CELL_W)));
         const row = Math.min(ROWS - 1, Math.max(0, Math.floor((py - MARGIN_Y) / CELL_H)));
-        if (!circleRectCollide(p.x, p.y, TANK_RADIUS, tileRectOf(col, row))) return { col, row };
+        if (!circleRectCollide(p.x, p.y, tankR(p), tileRectOf(col, row))) return { col, row };
     }
     return null;
 }
@@ -685,8 +685,8 @@ function driveTankMovement(target, ctrl, nitroActive) {
     let nx = target.x, ny = target.y;
     if (ctrl.up) { nx += Math.cos(target.a) * speed; ny += Math.sin(target.a) * speed; }
     if (ctrl.down) { nx -= Math.cos(target.a) * speed; ny -= Math.sin(target.a) * speed; }
-    if (!collidesAny(nx, target.y, TANK_RADIUS)) target.x = nx;
-    if (!collidesAny(target.x, ny, TANK_RADIUS)) target.y = ny;
+    if (!collidesAny(nx, target.y, tankR(target))) target.x = nx;
+    if (!collidesAny(target.x, ny, tankR(target))) target.y = ny;
 }
 
 // Ray (ox,oy)+t*(dx,dy) vs an axis-aligned rect, standard slab method.
@@ -867,6 +867,10 @@ const COLOR_NAMES = {
 };
 const MAX_PLAYERS = 4;
 let TANK_RADIUS = 15;
+// shrink powerup: this one tank's body + damage hitbox is SHRINK_MULT x its normal radius (which itself already
+// depends on the arena's grid size). p.shrinkUntil is 0 when not shrunk.
+const SHRINK_DURATION = 20000, SHRINK_MULT = 0.45;
+function tankR(p) { return p && p.shrinkUntil ? TANK_RADIUS * SHRINK_MULT : TANK_RADIUS; }
 let BULLET_RADIUS = 4;
 let BULLET_SPEED = 7;
 const SHOT_COOLDOWN = 1200;
@@ -1078,6 +1082,10 @@ let lasers = [];
 let shrapnel = [];
 let cleanEvents = []; // {id,x,y,spawnTime} - purely visual, broadcast to every client for the growing red wave
 let pendingCleanses = []; // {triggerAt, activatorId} - the actual gameplay effect, applied once the wave finishes
+// nuke powerup: a cosmetic (non-colliding) bomb dropped in the middle of a tile. 5s later it wipes a 3x3 area.
+const NUKE_FUSE = 5000, NUKE_EXPLOSION_TIME = 500, NUKE_DAMAGE_CENTER = 80, NUKE_DAMAGE_RING = 40;
+let nukes = []; // {id,col,row,ownerId,placedAt,explodeAt,exploded} - broadcast to everyone for the countdown + blast
+let nextNukeId = 1;
 let airstrikes = []; // {id,col,row,cx,cy,activatorId,confirmTime,damageApplied} - broadcast to everyone for the tile fade + explosion
 let bounceLasers = []; // {id,ownerId,x,y,vx,vy,bounces,points,hitIds,done} - growing/bouncing damage trail
 let blackHoles = []; // {id,col,row,triggerTime} - purely visual, broadcast for the 0.3s fade-out
@@ -1088,6 +1096,13 @@ let timeStopUntil = 0, timeStopOwnerId = null, simTimeOffset = 0, lastTickRealNo
 let placedWalls = []; // {id,col,row,hp,rect} - player-placed destructible obstacles
 let safeTiles = []; // {id,col,row,rect,ownerId} - safetile zones
 let nextSafeTileId = 1;
+// ---------- chat ----------
+const CHAT_MAX_CHARS = 30;      // 3 lines x 10 characters (the client does the line splitting)
+const CHAT_SHOW_MS = 4000;      // in-game bubble stays fully visible this long...
+const CHAT_FADE_MS = 700;       // ...then fades out over this long (client uses the same two numbers)
+const CHAT_COOLDOWN_MS = 700;   // flood guard: min time between two messages from one player
+const LOBBY_CHAT_KEEP = 14;     // lobby log length (newest first)
+let lobbyChat = [];             // {id,name,color,text} - index 0 is the newest message
 let nextPlayerId = 1, nextBulletId = 1, nextPowerupId = 1, nextExplosionId = 1, nextCleanEventId = 1, nextAirstrikeId = 1, nextBounceLaserId = 1, nextBlackHoleId = 1, nextWallId = 1;
 
 let gamePhase = "lobby"; // lobby | round | roundend | gameover
@@ -1113,7 +1128,7 @@ const DEBUG_POWERUP_RESTOCK = 3000; // ms after a box disappears before it reapp
 const debugSockets = new Set();
 let debugSlots = []; // {type,x,y,puId,respawnAt}
 
-const ALL_POWERUP_TYPES = ["nitro", "laser", "homing", "shield", "rc", "abomb", "powerbeam", "mg", "health", "teleport", "superbullet", "clean", "airstrike", "ghost", "bouncelaser", "hacking", "freeze", "blackhole", "flamethrower", "wall", "slide", "cannoncap", "clone", "shock", "darkness", "timestop", "swap", "fastbullet", "superhealth", "drone", "safetile", "joker", "magnet", "antimagnet", "slotmachine", "shotgun", "starbullet", "timeshield", "healthorb", "water"];
+const ALL_POWERUP_TYPES = ["nitro", "laser", "homing", "shield", "rc", "abomb", "powerbeam", "mg", "health", "teleport", "superbullet", "clean", "airstrike", "ghost", "bouncelaser", "hacking", "freeze", "blackhole", "flamethrower", "wall", "slide", "cannoncap", "clone", "shock", "darkness", "timestop", "swap", "fastbullet", "superhealth", "drone", "safetile", "joker", "magnet", "antimagnet", "slotmachine", "shotgun", "starbullet", "timeshield", "healthorb", "water", "bot", "shrink", "nuke"];
 // everything the joker can hand out (all powerups except the joker itself) - add a type to ALL_POWERUP_TYPES and it shows up here automatically
 const JOKER_CHOICES = ALL_POWERUP_TYPES.filter(t => t !== "joker");
 // slot machine: 3 random picks out of everything except the slot machine itself
@@ -1175,7 +1190,7 @@ function debugUpdate(now) {
         if (powerups.some(pu => pu.id === slot.puId)) continue;
         if (slot.respawnAt == null) { slot.respawnAt = now + DEBUG_POWERUP_RESTOCK; continue; }
         if (now < slot.respawnAt) continue;
-        if (playersArray().some(pl => pl.alive && Math.hypot(pl.x - slot.x, pl.y - slot.y) < TANK_RADIUS + POWERUP_RADIUS + 10 * SC)) continue;
+        if (playersArray().some(pl => pl.alive && Math.hypot(pl.x - slot.x, pl.y - slot.y) < tankR(pl) + POWERUP_RADIUS + 10 * SC)) continue;
         debugPlacePowerup(slot);
     }
 }
@@ -1197,8 +1212,11 @@ function removeAllClones() {
     for (const p of Object.values(players)) p.cloneId = null;
 }
 function teamIdOf(p) { return p.isClone ? p.cloneOwnerId : p.id; }
+let hostOverrideId = null; // set when someone holds N+M for 3s in the lobby
 function currentHostId() {
-    const ids = realPlayers().map(p => p.id);
+    const real = realPlayers();
+    if (hostOverrideId != null && real.some(p => p.id === hostOverrideId)) return hostOverrideId;
+    const ids = real.map(p => p.id);
     return ids.length ? Math.min(...ids) : null;
 }
 
@@ -1256,6 +1274,8 @@ function handleConnection(ws) {
         statShots: 0, statPowerups: 0, statDamage: 0, statDealt: 0, statSelfDamage: 0, statTiles: new Set(), powerupCounted: false,
         magnetAmmo: 0, magnetNextTick: 0, magnetActive: false,
         rcRocketId: null,
+        chatText: null, chatAt: 0,
+        shrinkUntil: 0,
         ws
     };
 
@@ -1273,6 +1293,20 @@ function handleConnection(ws) {
                 p.left = !!data.input.left;
                 p.right = !!data.input.right;
                 p.shoot = !!data.input.shoot;
+            } else if (data.type === "chat") {
+                // text is trimmed, stripped of control characters and cut to 30 characters
+                const text = Array.from(String(data.text || "").replace(/[\u0000-\u001f\u007f]/g, "").trim())
+                    .slice(0, CHAT_MAX_CHARS).join("").trimEnd();
+                const nowMs = Date.now();
+                if (!text || nowMs - (p.lastChatMsgAt || 0) < CHAT_COOLDOWN_MS) return;
+                if (gamePhase === "lobby") {
+                    p.lastChatMsgAt = nowMs;
+                    lobbyChat.unshift({ id, name: p.name || ("P" + id), color: p.color, text });
+                    if (lobbyChat.length > LOBBY_CHAT_KEEP) lobbyChat.length = LOBBY_CHAT_KEEP;
+                } else if ((gamePhase === "round" || gamePhase === "roundend") && p.alive) {
+                    p.lastChatMsgAt = nowMs;
+                    p.chatText = text; p.chatAt = nowMs;
+                }
             } else if (data.type === "ready") {
                 if (!p.ready && (!p.name || p.name.length < 1)) {
                     // can't ready up without a name
@@ -1290,12 +1324,15 @@ function handleConnection(ws) {
             } else if (data.type === "selfdestruct") {
                 // host only, mid-round: the host's own tank blows up
                 if (id === currentHostId() && gamePhase === "round" && p.alive) { p.hp = 0; p.alive = false; }
+            } else if (data.type === "claimhost") {
+                // lobby only: whoever held N + M for 3 seconds becomes the host
+                if (gamePhase === "lobby") hostOverrideId = id;
             } else if (data.type === "pause") {
                 if (id === currentHostId()) paused = !paused;
             } else if (data.type === "reset") {
                 if (gamePhase === "gameover") {
                     for (const pl of playersArray()) { pl.score = 0; pl.ready = false; pl.alive = false; resetStats(pl); }
-                    bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
+                    bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; nukes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
                     gamePhase = "lobby";
                     gameWinner = null;
                 }
@@ -1313,8 +1350,10 @@ function handleConnection(ws) {
         delete players[id];
         if (Object.keys(players).length === 0) {
             gamePhase = "lobby";
-            bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
+            bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; nukes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
             paused = false;
+            hostOverrideId = null;
+            lobbyChat = [];
         }
     });
     return id;
@@ -1333,7 +1372,7 @@ function startRound(now) {
         p.a = Math.random() * Math.PI * 2;
         resetPlayerState(p);
     });
-    bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
+    bullets = []; healthOrbs = []; powerups = []; lasers = []; shrapnel = []; cleanEvents = []; pendingCleanses = []; airstrikes = []; nukes = []; bounceLasers = []; blackHoles = []; placedWalls = []; safeTiles = []; shocks = []; darknessUntil = 0; darknessOwnerId = null; removeAllClones(); timeStopUntil = 0; timeStopOwnerId = null; simTimeOffset = 0;
     roundNumber++;
     gamePhase = "round";
     lonelyStart = null;
@@ -1343,6 +1382,8 @@ function startRound(now) {
 
 // Clears every per-round/per-life status on a tank (used at round start and for debug respawns).
 function resetPlayerState(p) {
+    p.chatText = null;
+    p.shrinkUntil = 0;
     p.waterSince = null; p.waterNextDmg = 0;
     p.nitroUntil = 0;
     p.ghostUntil = 0;
@@ -1470,7 +1511,7 @@ function safeMuzzleDistance(p, desired, radius) {
 
 function fireBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "normal",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1491,7 +1532,7 @@ function fireShotgun(p, now) {
         statAdd(p, "statShots");
         const a = baseA + off;
         p.a = a; // safeMuzzleDistance measures along p.a
-        const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
+        const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BULLET_RADIUS + WALL_T / 2);
         p.a = baseA;
         bullets.push({
             id: nextBulletId++, type: "normal",
@@ -1506,7 +1547,7 @@ function fireMG(p, now) {
     statAdd(p, "statShots");
     const spread = (Math.random() * 2 - 1) * (MG_SPREAD_DEG * Math.PI / 180);
     const a = p.a + spread;
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, MG_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, MG_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "mg",
         x: p.x + Math.cos(a) * d, y: p.y + Math.sin(a) * d,
@@ -1520,7 +1561,7 @@ function fireMG(p, now) {
 // auto-fire as fireBullet (not a single edge-triggered shot like MG/beam).
 function fireSuperBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "superbullet",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1531,7 +1572,7 @@ function fireSuperBullet(p, now) {
 
 function fireHealthOrb(p, now) {
     statAdd(p, "statShots");
-    const d = TANK_RADIUS + HEALORB_RADIUS * 0.5; // walls don't matter for the orb, no safe-muzzle clamp
+    const d = tankR(p) + HEALORB_RADIUS * 0.5; // walls don't matter for the orb, no safe-muzzle clamp
     const spd = BULLET_SPEED * HEALORB_SPEED_MULT;
     healthOrbs.push({
         id: nextHealthOrbId++, owner: p.id,
@@ -1545,7 +1586,7 @@ function fireHealthOrb(p, now) {
 // like a normal one. Pressing space again while it is alive calls burstStarBullet.
 function fireStarBullet(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     const id = nextBulletId++;
     bullets.push({
         id, type: "starbullet",
@@ -1577,7 +1618,7 @@ function burstStarBullet(b) {
 function fireFastBullet(p, now) {
     statAdd(p, "statShots");
     const spd = BULLET_SPEED * FASTBULLET_SPEED_MULT;
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BULLET_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BULLET_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "fastbullet",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1625,7 +1666,7 @@ function endDrone(p) {
 // since it needs a growing polyline, not a single point.
 function fireBouncingLaser(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, BOUNCE_LASER_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, BOUNCE_LASER_RADIUS + WALL_T / 2);
     const startX = p.x + Math.cos(p.a) * d, startY = p.y + Math.sin(p.a) * d;
     bounceLasers.push({
         id: nextBounceLaserId++,
@@ -1692,6 +1733,204 @@ function spawnClone(p, now) {
     p.cloneId = id;
 }
 
+// ---------- BOT powerup ----------
+// A small AI tank. Like a clone it is a full entry in `players` (flagged isClone so it stays out of
+// the lobby/score/colour logic, and teamIdOf() makes it part of its owner's team), but it is NOT
+// driven by its owner: runBotAI() sets its up/left/right/shoot every tick and the normal movement
+// and firing code does the rest - so it shoots regular bullets at the normal fire rate.
+const BOT_HP = 80;
+const BOT_COLOR = "#44444b"; // dark grey
+const BOT_STRAIGHT_MS = 3000; // drives straight ahead this long after being deployed
+const BOT_REPATH_MS = 200;
+function spawnBot(p, now) {
+    const id = "b" + p.id + "_" + (nextCloneSeq++);
+    players[id] = {
+        id, x: p.x, y: p.y, a: p.a,
+        color: BOT_COLOR, name: "bot",
+        alive: true, hp: BOT_HP, maxHp: BOT_HP, score: 0, ready: false,
+        up: false, down: false, left: false, right: false, shoot: false, prevShoot: false,
+        lastShot: now, nitroUntil: 0, ghostUntil: 0, frozenUntil: 0,
+        slideUntil: 0, vx: 0, vy: 0, va: 0, cannonCapUntil: 0,
+        powerup: null, laserCharging: false, laserChargeStart: 0,
+        powerBeamShots: 0, mgShots: 0, superBulletShots: 0, blackHoleShots: 0, wallShots: 0, waterShots: 0,
+        fastBulletShots: 0, droneActive: false, droneX: 0, droneY: 0, droneShots: 0, droneArmed: false,
+        flameFuel: 0, flameStartTime: 0, flameNextTick: 0,
+        abombId: null, rcRocketId: null,
+        teleportTargeting: false, teleportCursorX: 0, teleportCursorY: 0,
+        airstrikeTargeting: false, airstrikeCursorX: 0, airstrikeCursorY: 0, airstrikePending: false,
+        hackTargeting: false, hackCursorX: 0, hackCursorY: 0,
+        swapTargeting: false, swapCursorX: 0, swapCursorY: 0,
+        hackingTargetId: null, hackedById: null, hackEndsAt: 0,
+        cloneId: null, isClone: true, cloneOwnerId: p.id, cloneSpawnedAt: now,
+        isBot: true, botStartAt: now, botPath: null, botNextRepath: 0, botTargetId: null
+    };
+}
+
+// clear straight line for a circle of `radius` (walls, blocks, placed walls; safetiles also stop bullets)
+function botLineClear(x1, y1, x2, y2, radius, bulletLine) {
+    const d = Math.hypot(x2 - x1, y2 - y1);
+    const n = Math.max(1, Math.ceil(d / Math.max(4 * SC, radius)));
+    for (let i = 1; i <= n; i++) {
+        const t = i / n, x = x1 + (x2 - x1) * t, y = y1 + (y2 - y1) * t;
+        if (collidesAny(x, y, radius)) return false;
+        if (bulletLine && safeTiles.length && safeTileHit(x, y, radius)) return false;
+    }
+    return true;
+}
+// exact version of "would a bullet fly this line without touching a wall": uses the same wall
+// segments + radius the bullet physics bounce against (plus a small safety margin)
+function botShotClear(x1, y1, x2, y2) {
+    const R = BULLET_RADIUS + WALL_T / 2 + 1.2 * SC;
+    const d = Math.hypot(x2 - x1, y2 - y1), n = Math.max(1, Math.ceil(d / (3 * SC)));
+    const near = (x, y, seg) => {
+        const cp = closestPointOnSegment(x, y, seg.x1, seg.y1, seg.x2, seg.y2);
+        return Math.hypot(x - cp.x, y - cp.y) < R;
+    };
+    for (let i = 1; i <= n; i++) {
+        const t = i / n, x = x1 + (x2 - x1) * t, y = y1 + (y2 - y1) * t;
+        for (const seg of mazeSegments) if (near(x, y, seg)) return false;
+        for (const seg of solidSegments) if (near(x, y, seg)) return false;
+        for (const w of placedWalls) for (const seg of w.segments) if (near(x, y, seg)) return false;
+        if (safeTiles.length && safeTileHit(x, y, BULLET_RADIUS)) return false;
+    }
+    return true;
+}
+// how much of the straight line runs through water (regular bullets slow down and die there)
+function botWaterLen(x1, y1, x2, y2) {
+    if (!waterGrid) return 0;
+    const d = Math.hypot(x2 - x1, y2 - y1), step = 4 * SC, n = Math.max(1, Math.ceil(d / step));
+    let len = 0;
+    for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        if (isWaterAt(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)) len += d / n;
+    }
+    return len;
+}
+function botCellOf(x, y) {
+    return {
+        col: Math.min(COLS - 1, Math.max(0, Math.floor((x - MARGIN_X) / CELL_W))),
+        row: Math.min(ROWS - 1, Math.max(0, Math.floor((y - MARGIN_Y) / CELL_H)))
+    };
+}
+function botCellCenter(col, row) { return { x: MARGIN_X + col * CELL_W + CELL_W / 2, y: MARGIN_Y + row * CELL_H + CELL_H / 2 }; }
+
+// Shortest path over the tile grid (Dijkstra, water tiles cost triple because tanks are slow there).
+// A step between two neighbouring tiles only exists when a tank-sized circle can drive between
+// their centres, so walls, solid blocks and player-placed walls are all avoided. Returns the
+// list of {col,row} from the start tile to the goal tile, or null when unreachable.
+function botFindPath(sx, sy, tx, ty) {
+    const a = botCellOf(sx, sy), b = botCellOf(tx, ty);
+    const idx = (c, r) => r * COLS + c;
+    const N = COLS * ROWS, dist = new Array(N).fill(Infinity), prev = new Array(N).fill(-1), done = new Array(N).fill(false);
+    const edgeCache = new Map();
+    const canStep = (c1, r1, c2, r2) => {
+        const k = idx(c1, r1) * N + idx(c2, r2);
+        let v = edgeCache.get(k);
+        if (v === undefined) {
+            const p1 = botCellCenter(c1, r1), p2 = botCellCenter(c2, r2);
+            v = !collidesAny(p2.x, p2.y, TANK_RADIUS) && botLineClear(p1.x, p1.y, p2.x, p2.y, TANK_RADIUS * 0.95, false);
+            edgeCache.set(k, v);
+        }
+        return v;
+    };
+    const start = idx(a.col, a.row), goal = idx(b.col, b.row);
+    dist[start] = 0;
+    for (;;) {
+        let u = -1, best = Infinity;
+        for (let i = 0; i < N; i++) if (!done[i] && dist[i] < best) { best = dist[i]; u = i; }
+        if (u === -1 || u === goal) break;
+        done[u] = true;
+        const uc = u % COLS, ur = Math.floor(u / COLS);
+        for (const [dc, dr] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            const nc = uc + dc, nr = ur + dr;
+            if (nc < 0 || nr < 0 || nc >= COLS || nr >= ROWS) continue;
+            const v = idx(nc, nr);
+            if (done[v] || !canStep(uc, ur, nc, nr)) continue;
+            const cost = 1 + (waterGrid && waterGrid[nr][nc] ? 2 : 0);
+            if (dist[u] + cost < dist[v]) { dist[v] = dist[u] + cost; prev[v] = u; }
+        }
+    }
+    if (dist[goal] === Infinity) return null;
+    const path = [];
+    for (let u = goal; u !== -1; u = prev[u]) path.push({ col: u % COLS, row: Math.floor(u / COLS) });
+    return path.reverse();
+}
+
+// closest living tank that isn't on the bot's team (and isn't an invisible ghost)
+function botPickTarget(bot, now) {
+    let best = null, bestD = Infinity;
+    for (const pl of playersArray()) {
+        if (!pl.alive || teamIdOf(pl) === teamIdOf(bot) || now < pl.ghostUntil) continue;
+        const d = Math.hypot(pl.x - bot.x, pl.y - bot.y);
+        if (d < bestD) { bestD = d; best = pl; }
+    }
+    return best;
+}
+function botDistToSegment(px, py, x1, y1, x2, y2) {
+    const dx = x2 - x1, dy = y2 - y1, l2 = dx * dx + dy * dy;
+    const t = l2 === 0 ? 0 : Math.max(0, Math.min(1, ((px - x1) * dx + (py - y1) * dy) / l2));
+    return Math.hypot(px - (x1 + dx * t), py - (y1 + dy * t));
+}
+// steer: turn toward heading `h`, drive forward when roughly facing it. Returns the remaining angle error.
+function botSteer(bot, h, moveAllowed, maxMoveErr) {
+    let diff = normalizeAngle(h - bot.a);
+    bot.left = false; bot.right = false;
+    if (Math.abs(diff) <= BASE_ROT) { bot.a = h; diff = 0; } // less than one turn step off: lock on exactly
+    else if (diff < 0) bot.left = true;
+    else bot.right = true;
+    bot.up = moveAllowed && Math.abs(diff) < maxMoveErr;
+    return diff;
+}
+
+function runBotAI(bot, now) {
+    bot.up = bot.down = bot.left = bot.right = bot.shoot = false;
+    // phase 1: drive straight ahead for 3 seconds
+    if (now - bot.botStartAt < BOT_STRAIGHT_MS) { bot.up = true; return; }
+
+    const target = botPickTarget(bot, now);
+    if (!target) return; // nobody to hunt
+    if (bot.botTargetId !== target.id) { bot.botTargetId = target.id; bot.botNextRepath = 0; }
+
+    const dTarget = Math.hypot(target.x - bot.x, target.y - bot.y);
+    const heading = Math.atan2(target.y - bot.y, target.x - bot.x);
+
+    // can a bullet fly straight from the muzzle to the enemy?
+    const mx = bot.x + Math.cos(bot.a) * (tankR(bot) + 6 * SC), my = bot.y + Math.sin(bot.a) * (tankR(bot) + 6 * SC);
+    const sightClear = botShotClear(bot.x, bot.y, target.x, target.y)
+        && botWaterLen(bot.x, bot.y, target.x, target.y) <= TILE_SIZE * 1.5; // a long swim would sink the bullet
+    if (sightClear) {
+        const diff = botSteer(bot, heading, dTarget > TILE_SIZE * 2, 0.6);
+        if (Math.abs(diff) < 0.02 && botShotClear(mx, my, target.x, target.y)) {
+            // never shoot through a teammate (that would hurt its own team)
+            let friendly = false;
+            for (const pl of playersArray()) {
+                if (!pl.alive || pl.id === bot.id || pl.id === target.id || teamIdOf(pl) !== teamIdOf(bot)) continue;
+                if (botDistToSegment(pl.x, pl.y, bot.x, bot.y, target.x, target.y) < tankR(pl) + BULLET_RADIUS + 2 * SC) { friendly = true; break; }
+            }
+            if (!friendly) bot.shoot = true;
+        }
+        return;
+    }
+
+    // no clear shot: follow the shortest path to the enemy's tile (re-planned a few times a second)
+    if (now >= bot.botNextRepath) {
+        bot.botPath = botFindPath(bot.x, bot.y, target.x, target.y);
+        bot.botNextRepath = now + BOT_REPATH_MS;
+    }
+    let wx = target.x, wy = target.y;
+    if (bot.botPath && bot.botPath.length > 1) {
+        // next tile on the route; if the straight line to it clips a wall corner, first go to our own tile centre
+        const here = botCellOf(bot.x, bot.y);
+        let i = bot.botPath.findIndex(c => c.col === here.col && c.row === here.row);
+        if (i < 0) i = 0;
+        const nxt = bot.botPath[Math.min(i + 1, bot.botPath.length - 1)];
+        const nc = botCellCenter(nxt.col, nxt.row);
+        if (botLineClear(bot.x, bot.y, nc.x, nc.y, TANK_RADIUS * 0.9, false)) { wx = nc.x; wy = nc.y; }
+        else { const hc = botCellCenter(here.col, here.row); wx = hc.x; wy = hc.y; }
+    }
+    botSteer(bot, Math.atan2(wy - bot.y, wx - bot.x), true, 1.0);
+}
+
 // Straight line of tiles from the tank's own tile to the arena edge, snapped
 // to whichever of the 4 axes its cannon is closest to (never diagonal).
 function computeShockTiles(p) {
@@ -1716,7 +1955,7 @@ function triggerWallPlacement(p, now) {
     const tile = computeFrontTile(p);
     if (!tile) return false;
     const rect = tileRectOf(tile.col, tile.row);
-    const blocked = playersArray().some(pl => pl.alive && circleRectCollide(pl.x, pl.y, TANK_RADIUS, rect))
+    const blocked = playersArray().some(pl => pl.alive && circleRectCollide(pl.x, pl.y, tankR(pl), rect))
         || placedWalls.some(w => w.col === tile.col && w.row === tile.row)
         || isBlockCell(tile.col, tile.row); // walls may be built on water
     if (blocked) return false;
@@ -1752,6 +1991,49 @@ function triggerSafetilePlacement(p, now) {
     return true;
 }
 
+function placeNuke(p, now) {
+    const col = Math.min(COLS - 1, Math.max(0, Math.floor((p.x - MARGIN_X) / CELL_W)));
+    const row = Math.min(ROWS - 1, Math.max(0, Math.floor((p.y - MARGIN_Y) / CELL_H)));
+    nukes.push({ id: nextNukeId++, col, row, ownerId: p.id, placedAt: now, explodeAt: now + NUKE_FUSE, exploded: false });
+}
+
+// The blast: everything in the 3x3 block of tiles around the bomb disappears (maze walls, solid blocks, water,
+// placed walls, safetiles, powerups on the ground, bullets...). Tanks touching the centre tile take 80,
+// tanks touching only the outer ring take 40 (a held shield absorbs it, like the other tile attacks).
+function detonateNuke(n, now) {
+    n.exploded = true;
+    const c0 = Math.max(0, n.col - 1), c1 = Math.min(COLS - 1, n.col + 1);
+    const r0 = Math.max(0, n.row - 1), r1 = Math.min(ROWS - 1, n.row + 1);
+    const area = { x: MARGIN_X + c0 * CELL_W, y: MARGIN_Y + r0 * CELL_H, w: (c1 - c0 + 1) * CELL_W, h: (r1 - r0 + 1) * CELL_H };
+    const inArea = (c, r) => c >= c0 && c <= c1 && r >= r0 && r <= r1;
+
+    clearTileProjectilesAndPowerups(area);
+    healthOrbs = healthOrbs.filter(o => !pointInRect(o.x, o.y, area));
+    placedWalls = placedWalls.filter(w => !inArea(w.col, w.row));
+    safeTiles = safeTiles.filter(st => !inArea(st.col, st.row));
+    let blocksGone = false;
+    for (let r = r0; r <= r1; r++) {
+        for (let c = c0; c <= c1; c++) {
+            if (isWaterCell(c, r)) waterGrid[r][c] = false;
+            if (isBlockCell(c, r)) { solidBlocks = solidBlocks.filter(b => !(b.col === c && b.row === r)); blocksGone = true; }
+            destroyNeighboringWalls(c, r); // every maze wall touching these tiles (never the outer frame)
+        }
+    }
+    if (blocksGone) rebuildSolidSegments();
+
+    const middle = tileRectOf(n.col, n.row);
+    for (const pl of playersArray()) {
+        if (!pl.alive) continue;
+        const r = tankR(pl);
+        let dmg = 0;
+        if (circleRectCollide(pl.x, pl.y, r, middle)) dmg = NUKE_DAMAGE_CENTER;
+        else if (circleRectCollide(pl.x, pl.y, r, area)) dmg = NUKE_DAMAGE_RING;
+        if (!dmg) continue;
+        if (pl.powerup === "shield") pl.powerup = null;
+        else applyDamage(pl, dmg, n.ownerId, true);
+    }
+}
+
 function triggerBlackHole(p, now) {
     const tile = computeFrontTile(p);
     if (!tile) return;
@@ -1768,7 +2050,7 @@ function triggerBlackHole(p, now) {
 
     for (const pl of playersArray()) {
         if (!pl.alive) continue;
-        if (circleRectCollide(pl.x, pl.y, TANK_RADIUS, rect)) {
+        if (circleRectCollide(pl.x, pl.y, tankR(pl), rect)) {
             if (pl.powerup === "shield") pl.powerup = null;
             else applyDamage(pl, BLACKHOLE_DAMAGE, p.id, true);
         }
@@ -1780,7 +2062,7 @@ function triggerBlackHole(p, now) {
 
 function fireHoming(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, HOMING_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, HOMING_RADIUS + WALL_T / 2);
     bullets.push({
         id: nextBulletId++, type: "homing",
         x: p.x + Math.cos(p.a) * d, y: p.y + Math.sin(p.a) * d,
@@ -1791,7 +2073,7 @@ function fireHoming(p, now) {
 
 function fireRC(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, RC_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, RC_RADIUS + WALL_T / 2);
     const rid = nextBulletId++;
     bullets.push({
         id: rid, type: "rc",
@@ -1803,7 +2085,7 @@ function fireRC(p, now) {
 
 function fireAbomb(p, now) {
     statAdd(p, "statShots");
-    const d = safeMuzzleDistance(p, TANK_RADIUS + 6 * SC, ABOMB_RADIUS + WALL_T / 2);
+    const d = safeMuzzleDistance(p, tankR(p) + 6 * SC, ABOMB_RADIUS + WALL_T / 2);
     const id = nextBulletId++;
     bullets.push({
         id, type: "abomb",
@@ -1839,7 +2121,7 @@ function fireLaser(p, now) {
         if (t < 0) continue;
         const cx = p.x + cosA * t, cy = p.y + sinA * t;
         const dist = Math.hypot(q.x - cx, q.y - cy);
-        if (dist < TANK_RADIUS + LASER_HALF_WIDTH) {
+        if (dist < tankR(q) + LASER_HALF_WIDTH) {
             if (q.powerup === "shield") q.powerup = null;
             else applyDamage(q, DAMAGE.laser, p.id);
         }
@@ -1865,7 +2147,7 @@ function firePowerBeam(p, now) {
         if (t < 0 || t > wallDist) continue;
         const cx = p.x + cosA * t, cy = p.y + sinA * t;
         const dist = Math.hypot(q.x - cx, q.y - cy);
-        if (dist < TANK_RADIUS + POWER_BEAM_HALF_WIDTH) {
+        if (dist < tankR(q) + POWER_BEAM_HALF_WIDTH) {
             if (q.powerup === "shield") q.powerup = null;
             else applyDamage(q, DAMAGE.powerbeam, p.id);
         }
@@ -1876,16 +2158,18 @@ function firePowerBeam(p, now) {
         color: p.color, expires: now + POWER_BEAM_VISUAL_TIME, kind: "powerbeam"
     });
     const kx = p.x - cosA * POWER_BEAM_KNOCKBACK, ky = p.y - sinA * POWER_BEAM_KNOCKBACK;
-    if (!collidesAny(kx, p.y, TANK_RADIUS)) p.x = kx;
-    if (!collidesAny(p.x, ky, TANK_RADIUS)) p.y = ky;
+    if (!collidesAny(kx, p.y, tankR(p))) p.x = kx;
+    if (!collidesAny(p.x, ky, tankR(p))) p.y = ky;
 }
 
 // Gives a powerup to a tank. Used by normal pickups AND by the joker's choice,
 // so every powerup type is set up in exactly one place.
 function grantPowerup(p, type, now) {
-    if (type === "nitro" || type === "health" || type === "superhealth") statAdd(p, "statPowerups"); // instant ones are used on pickup
+    if (type === "nitro" || type === "health" || type === "superhealth" || type === "shrink") statAdd(p, "statPowerups"); // instant ones are used on pickup
     if (type === "nitro") {
         p.nitroUntil = now + NITRO_DURATION;
+    } else if (type === "shrink") {
+        p.shrinkUntil = now + SHRINK_DURATION; // instant, keeps whatever weapon is held
     } else if (type === "health") {
         p.hp = Math.min(MAX_HP, p.hp + HEALTH_PACK_AMOUNT);
     } else if (type === "superhealth") {
@@ -1955,7 +2239,7 @@ function runMagnets(now, timeStopped) {
         }
         p.magnetActive = true;
         const cx = Math.cos(p.a), cy = Math.sin(p.a);
-        beams.push({ p, cx, cy, ox: p.x + cx * (TANK_RADIUS + 7 * SC), oy: p.y + cy * (TANK_RADIUS + 7 * SC), push: p.powerup === "antimagnet" });
+        beams.push({ p, cx, cy, ox: p.x + cx * (tankR(p) + 7 * SC), oy: p.y + cy * (tankR(p) + 7 * SC), push: p.powerup === "antimagnet" });
     }
     if (beams.length === 0) return;
 
@@ -1981,16 +2265,16 @@ function runMagnets(now, timeStopped) {
 
     for (const pl of all) {
         if (!pl.alive) continue;
-        const bm = find(pl.x, pl.y, TANK_RADIUS, pl);
+        const bm = find(pl.x, pl.y, tankR(pl), pl);
         if (!bm) continue;
         const d = dirFrom(bm, pl.x, pl.y);
         if (!d) continue;
         pl.dragged = true; // movement is overridden; enemy tanks keep rotation
         if (teamIdOf(pl) === teamIdOf(bm.p)) pl.dragFull = true; // own clone: no control at all while dragged
-        if (!bm.push && d.len <= TANK_RADIUS * 2) continue; // already touching the beam user
+        if (!bm.push && d.len <= tankR(pl) + tankR(bm.p)) continue; // already touching the beam user
         const nx = pl.x + d.x * BASE_SPEED, ny = pl.y + d.y * BASE_SPEED;
-        if (!collidesAny(nx, pl.y, TANK_RADIUS)) pl.x = nx;
-        if (!collidesAny(pl.x, ny, TANK_RADIUS)) pl.y = ny;
+        if (!collidesAny(nx, pl.y, tankR(pl))) pl.x = nx;
+        if (!collidesAny(pl.x, ny, tankR(pl))) pl.y = ny;
     }
 
     for (const pl of all) {
@@ -2000,7 +2284,7 @@ function runMagnets(now, timeStopped) {
         const d = dirFrom(bm, pl.droneX, pl.droneY);
         if (!d) continue;
         pl.droneDragged = true;
-        if (!bm.push && d.len <= TANK_RADIUS + DRONE_SIZE / 2) continue;
+        if (!bm.push && d.len <= tankR(bm.p) + DRONE_SIZE / 2) continue;
         const sp = BASE_SPEED * DRONE_SPEED_MULT;
         pl.droneX += d.x * sp; pl.droneY += d.y * sp;
     }
@@ -2026,6 +2310,10 @@ function runMagnets(now, timeStopped) {
 
 function updateRound(now, realNow) {
     const timeStopped = realNow < timeStopUntil;
+    // shrink runs out: only grow back once the full-size tank fits where it stands (never regrow inside a wall)
+    for (const p of playersArray()) {
+        if (p.shrinkUntil && now >= p.shrinkUntil && !collidesAny(p.x, p.y, TANK_RADIUS)) p.shrinkUntil = 0;
+    }
     // clones mirror their owner's input, and hand control back when they die
     for (const p of playersArray()) {
         if (!p.isClone) continue;
@@ -2035,6 +2323,7 @@ function updateRound(now, realNow) {
             delete players[p.id];
             continue;
         }
+        if (p.isBot) { runBotAI(p, now); continue; } // bots think for themselves
         p.up = owner.up; p.down = owner.down; p.left = owner.left; p.right = owner.right;
         p.shoot = owner.shoot;
     }
@@ -2045,7 +2334,7 @@ function updateRound(now, realNow) {
         for (const p of playersArray()) {
             if (!p.alive) continue;
             if (p.teleportTargeting || p.airstrikeTargeting || p.hackTargeting || p.swapTargeting || p.jokerSelecting) continue;
-            if (safeTileHit(p.x, p.y, TANK_RADIUS)) p.shoot = false;
+            if (safeTileHit(p.x, p.y, tankR(p))) p.shoot = false;
         }
     }
     runMagnets(now, timeStopped);
@@ -2244,7 +2533,7 @@ function updateRound(now, realNow) {
                 const col = Math.min(COLS - 1, Math.max(0, Math.floor((p.swapCursorX - MARGIN_X) / CELL_W)));
                 const row = Math.min(ROWS - 1, Math.max(0, Math.floor((p.swapCursorY - MARGIN_Y) / CELL_H)));
                 const tileRect = { x: MARGIN_X + col * CELL_W, y: MARGIN_Y + row * CELL_H, w: CELL_W, h: CELL_H };
-                const touching = playersArray().filter(pl => pl.id !== p.id && pl.alive && circleRectCollide(pl.x, pl.y, TANK_RADIUS, tileRect));
+                const touching = playersArray().filter(pl => pl.id !== p.id && pl.alive && circleRectCollide(pl.x, pl.y, tankR(pl), tileRect));
                 p.swapTargeting = false;
                 p.powerup = null; // consumed regardless of outcome
                 if (touching.length === 1) {
@@ -2274,7 +2563,7 @@ function updateRound(now, realNow) {
                 const col = Math.min(COLS - 1, Math.max(0, Math.floor((p.hackCursorX - MARGIN_X) / CELL_W)));
                 const row = Math.min(ROWS - 1, Math.max(0, Math.floor((p.hackCursorY - MARGIN_Y) / CELL_H)));
                 const tileRect = { x: MARGIN_X + col * CELL_W, y: MARGIN_Y + row * CELL_H, w: CELL_W, h: CELL_H };
-                const touching = playersArray().filter(pl => pl.id !== p.id && pl.alive && circleRectCollide(pl.x, pl.y, TANK_RADIUS, tileRect));
+                const touching = playersArray().filter(pl => pl.id !== p.id && pl.alive && circleRectCollide(pl.x, pl.y, tankR(pl), tileRect));
                 p.hackTargeting = false;
                 p.powerup = null; // consumed regardless of outcome
                 if (touching.length === 1) {
@@ -2318,8 +2607,8 @@ function updateRound(now, realNow) {
             if (curSpeed > maxSpeed) { p.vx *= maxSpeed / curSpeed; p.vy *= maxSpeed / curSpeed; }
             if (p.dragged) { p.vx = 0; p.vy = 0; }
             const nx = p.x + p.vx, ny = p.y + p.vy;
-            if (!collidesAny(nx, p.y, TANK_RADIUS)) p.x = nx; else p.vx = 0;
-            if (!collidesAny(p.x, ny, TANK_RADIUS)) p.y = ny; else p.vy = 0;
+            if (!collidesAny(nx, p.y, tankR(p))) p.x = nx; else p.vx = 0;
+            if (!collidesAny(p.x, ny, tankR(p))) p.y = ny; else p.vy = 0;
         } else {
             if (p.left) p.a -= rot;
             if (p.right) p.a += rot;
@@ -2329,8 +2618,8 @@ function updateRound(now, realNow) {
             let nx = p.x, ny = p.y;
             if (p.up && !p.dragged) { nx += Math.cos(p.a) * speed; ny += Math.sin(p.a) * speed; }
             if (p.down && !p.dragged) { nx -= Math.cos(p.a) * speed; ny -= Math.sin(p.a) * speed; }
-            if (!collidesAny(nx, p.y, TANK_RADIUS)) p.x = nx;
-            if (!collidesAny(p.x, ny, TANK_RADIUS)) p.y = ny;
+            if (!collidesAny(nx, p.y, tankR(p))) p.x = nx;
+            if (!collidesAny(p.x, ny, tankR(p))) p.y = ny;
         }
 
         // fun stats: tiles this tank has touched, and first use of a held powerup
@@ -2534,6 +2823,13 @@ function updateRound(now, realNow) {
                 p.powerup = null;
                 p.lastShot = now;
             }
+        } else if (p.powerup === "bot") {
+            // no bullet: a dark grey bot tank is deployed on the spot, facing the same way
+            if (p.shoot && !p.prevShoot) {
+                spawnBot(p, now);
+                p.powerup = null;
+                p.lastShot = now;
+            }
         } else if (p.powerup === "clone") {
             if (p.shoot && !p.prevShoot) {
                 spawnClone(p, now);
@@ -2570,6 +2866,12 @@ function updateRound(now, realNow) {
                 timeStopUntil = realNow + TIME_STOP_DURATION;
                 timeStopOwnerId = teamIdOf(p);
                 p.powerup = null;
+                p.lastShot = now;
+            }
+        } else if (p.powerup === "nuke") {
+            if (p.shoot && !p.prevShoot) {
+                placeNuke(p, now);
+                p.powerup = null; // single use
                 p.lastShot = now;
             }
         } else if (p.powerup === "safetile") {
@@ -2621,7 +2923,7 @@ function updateRound(now, realNow) {
                     p.flameFuel -= FLAME_FUEL_PER_TICK;
                     for (const pl of playersArray()) {
                         if (!pl.alive || pl.id === p.id) continue;
-                        if (inFlameCone(p, pl.x, pl.y, TANK_RADIUS, curLen)) {
+                        if (inFlameCone(p, pl.x, pl.y, tankR(pl), curLen)) {
                             if (pl.powerup === "shield") pl.powerup = null;
                             else applyDamage(pl, FLAME_DAMAGE_PER_TICK, p.id);
                         }
@@ -2691,7 +2993,7 @@ function updateRound(now, realNow) {
             for (const pl of playersArray()) {
                 if (!pl.alive) continue;
                 const dx = pl.x - b.x, dy = pl.y - b.y;
-                if (dx * dx + dy * dy < (TANK_RADIUS + RC_RADIUS) * (TANK_RADIUS + RC_RADIUS)) {
+                if (dx * dx + dy * dy < (tankR(pl) + RC_RADIUS) * (tankR(pl) + RC_RADIUS)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, DAMAGE.rc, b.owner);
                     hitTank = true;
@@ -2730,7 +3032,7 @@ function updateRound(now, realNow) {
                     b.vx = Math.cos(newA) * HOMING_SPEED; b.vy = Math.sin(newA) * HOMING_SPEED;
                 }
                 { const hw = isWaterAt(b.x, b.y) ? WATER_BULLET_SPEED : 1; b.x += b.vx * hw; b.y += b.vy * hw; }
-                if (Math.hypot(t.x - b.x, t.y - b.y) < TANK_RADIUS + HOMING_RADIUS) {
+                if (Math.hypot(t.x - b.x, t.y - b.y) < tankR(t) + HOMING_RADIUS) {
                     if (t.powerup === "shield") t.powerup = null;
                     else applyDamage(t, DAMAGE.homing, b.owner);
                     continue; // missile consumed either way
@@ -2760,7 +3062,7 @@ function updateRound(now, realNow) {
             for (const pl of playersArray()) {
                 if (!pl.alive) continue;
                 const dx = pl.x - b.x, dy = pl.y - b.y;
-                if (dx * dx + dy * dy < (TANK_RADIUS + ABOMB_RADIUS) * (TANK_RADIUS + ABOMB_RADIUS)) {
+                if (dx * dx + dy * dy < (tankR(pl) + ABOMB_RADIUS) * (tankR(pl) + ABOMB_RADIUS)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, DAMAGE.abomb, b.owner);
                     hitTank = true;
@@ -2791,7 +3093,7 @@ function updateRound(now, realNow) {
             for (const pl of playersArray()) {
                 if (!pl.alive) continue;
                 const dx = pl.x - b.x, dy = pl.y - b.y;
-                if (dx * dx + dy * dy < (TANK_RADIUS + bRadius) * (TANK_RADIUS + bRadius)) {
+                if (dx * dx + dy * dy < (tankR(pl) + bRadius) * (tankR(pl) + bRadius)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, DAMAGE[b.type] || DAMAGE.bullet, b.owner);
                     hit = true;
@@ -2836,7 +3138,7 @@ function updateRound(now, realNow) {
             o.targetId = best ? best.id : null;
             if (best && !timeStopped && now >= o.nextHealAt) {
                 o.nextHealAt = now + HEALORB_TICK;
-                best.hp = Math.min(MAX_HP, best.hp + HEALORB_HP_PER_TICK);
+                best.hp = Math.min(best.maxHp || MAX_HP, best.hp + HEALORB_HP_PER_TICK);
             }
             keep.push(o);
         }
@@ -2860,7 +3162,7 @@ function updateRound(now, realNow) {
         for (const pl of playersArray()) {
             if (!pl.alive) continue;
             const dx = pl.x - s.x, dy = pl.y - s.y;
-            if (dx * dx + dy * dy < (TANK_RADIUS + SHRAPNEL_RADIUS) * (TANK_RADIUS + SHRAPNEL_RADIUS)) {
+            if (dx * dx + dy * dy < (tankR(pl) + SHRAPNEL_RADIUS) * (tankR(pl) + SHRAPNEL_RADIUS)) {
                 if (pl.powerup === "shield") pl.powerup = null;
                 else applyDamage(pl, DAMAGE.abomb, s.ownerId);
                 consumed = true;
@@ -2916,6 +3218,7 @@ function updateRound(now, realNow) {
             pl.ghostUntil = 0;
             pl.frozenUntil = 0;
             pl.slideUntil = 0;
+            if (pl.shrinkUntil) pl.shrinkUntil = 1; // clean ends it, but via the safe regrow check above
             pl.vx = 0;
             pl.vy = 0;
             pl.va = 0;
@@ -2949,6 +3252,13 @@ function updateRound(now, realNow) {
     cleanEvents = cleanEvents.filter(e => now - e.spawnTime < CLEAN_ANIMATION_TIME + 300);
     blackHoles = blackHoles.filter(bh => now - bh.triggerTime < 600); // purely visual, well past the 0.3s fade
 
+    // nuke: blast when the 5s countdown ends, then the 0.5s explosion visual, then it is gone
+    for (let i = nukes.length - 1; i >= 0; i--) {
+        const nk = nukes[i];
+        if (!nk.exploded && now >= nk.explodeAt) detonateNuke(nk, now);
+        if (nk.exploded && now - nk.explodeAt >= NUKE_EXPLOSION_TIME) nukes.splice(i, 1);
+    }
+
     // "airstrike" powerup: damage resolves the instant the 1s fade ends;
     // the strike (and its owner's frozen weapon slot) fully clears once the
     // 0.5s explosion visual afterward has also finished.
@@ -2959,7 +3269,7 @@ function updateRound(now, realNow) {
             const tileRect = { x: MARGIN_X + s.col * CELL_W, y: MARGIN_Y + s.row * CELL_H, w: CELL_W, h: CELL_H };
             for (const pl of playersArray()) {
                 if (!pl.alive) continue;
-                if (circleRectCollide(pl.x, pl.y, TANK_RADIUS, tileRect)) {
+                if (circleRectCollide(pl.x, pl.y, tankR(pl), tileRect)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, AIRSTRIKE_DAMAGE, s.activatorId, true);
                 }
@@ -2994,7 +3304,7 @@ function updateRound(now, realNow) {
             if (!pl.alive || pl.id === bl.ownerId || bl.hitIds.has(pl.id)) continue;
             for (let i = 0; i < bl.points.length - 1; i++) {
                 const a = bl.points[i], b2 = bl.points[i + 1];
-                if (pointSegmentDistSq(pl.x, pl.y, a.x, a.y, b2.x, b2.y) < (TANK_RADIUS + BOUNCE_LASER_RADIUS) * (TANK_RADIUS + BOUNCE_LASER_RADIUS)) {
+                if (pointSegmentDistSq(pl.x, pl.y, a.x, a.y, b2.x, b2.y) < (tankR(pl) + BOUNCE_LASER_RADIUS) * (tankR(pl) + BOUNCE_LASER_RADIUS)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, BOUNCE_LASER_DAMAGE, bl.ownerId);
                     bl.hitIds.add(pl.id);
@@ -3017,7 +3327,7 @@ function updateRound(now, realNow) {
             const rect = tileRectOf(t.col, t.row);
             for (const pl of playersArray()) {
                 if (!pl.alive || teamIdOf(pl) === sh.ownerId) continue;
-                if (circleRectCollide(pl.x, pl.y, TANK_RADIUS, rect)) {
+                if (circleRectCollide(pl.x, pl.y, tankR(pl), rect)) {
                     if (pl.powerup === "shield") pl.powerup = null;
                     else applyDamage(pl, SHOCK_DAMAGE, sh.ownerId, true);
                 }
@@ -3034,11 +3344,11 @@ function updateRound(now, realNow) {
 
     // powerup pickups - always replaces whatever the player is currently carrying
     for (const p of playersArray()) {
-        if (!p.alive) continue;
+        if (!p.alive || p.isBot) continue;
         for (let i = powerups.length - 1; i >= 0; i--) {
             const pu = powerups[i];
             const dist = Math.hypot(p.x - pu.x, p.y - pu.y);
-            if (dist < TANK_RADIUS + POWERUP_RADIUS) {
+            if (dist < tankR(p) + POWERUP_RADIUS) {
                 grantPowerup(p, pu.type, now);
                 powerups.splice(i, 1);
             }
@@ -3136,12 +3446,14 @@ function broadcastState(now) {
         else if (p.powerup === "flamethrower") glow = "#ff1744";
         else if (p.powerup === "wall") glow = "#78716c";
         else if (p.powerup === "water") glow = "#4f9cf0";
+        else if (p.powerup === "bot") glow = "#000000"; // black
+        else if (p.powerup === "nuke") glow = "#ffe600"; // yellow
         else if (now < p.ghostUntil) glow = "#94a3b8"; // shown while the invisibility itself is running
         else if (now < p.nitroUntil) glow = "#ffd60a";
         const needsFrontTile = p.alive && (p.powerup === "blackhole" || p.powerup === "wall" || p.powerup === "safetile" || p.powerup === "water");
         const frontTile = needsFrontTile ? computeFrontTile(p) : null;
         const wallBlocked = (p.powerup === "wall" && frontTile)
-            ? playersArray().some(pl => pl.alive && circleRectCollide(pl.x, pl.y, TANK_RADIUS, tileRectOf(frontTile.col, frontTile.row)))
+            ? playersArray().some(pl => pl.alive && circleRectCollide(pl.x, pl.y, tankR(pl), tileRectOf(frontTile.col, frontTile.row)))
                 || placedWalls.some(w => w.col === frontTile.col && w.row === frontTile.row)
                 || isBlockCell(frontTile.col, frontTile.row)
             : false;
@@ -3169,7 +3481,9 @@ function broadcastState(now) {
             flameLen: p.powerup === "flamethrower" && p.flameStartTime > 0
                 ? FLAME_MAX_LENGTH * Math.min(1, (now - p.flameStartTime) / FLAME_GROW_TIME)
                 : 0,
-            hp: p.hp,
+            hp: p.hp, maxHp: p.maxHp || MAX_HP, isBot: !!p.isBot,
+            sizeMult: p.shrinkUntil ? SHRINK_MULT : 1,
+            chat: (p.chatText && Date.now() - p.chatAt < CHAT_SHOW_MS + CHAT_FADE_MS) ? { text: p.chatText, age: Date.now() - p.chatAt } : null,
             magnetAmmo: p.magnetAmmo || 0,
             magnetActive: !!p.magnetActive,
             jokerSelecting: !!p.jokerSelecting,
@@ -3216,6 +3530,7 @@ function broadcastState(now) {
         type: "state",
         state: {
             gamePhase, roundNumber, paused, hostId,
+            lobbyChat: gamePhase === "lobby" ? lobbyChat : [],
             players: outPlayers,
             bullets: bullets.map(b => {
                 if (b.type === "homing") return { x: b.x, y: b.y, a: Math.atan2(b.vy, b.vx), type: "homing", color: b.color, spawnTime: b.spawnTime, maxLife: HOMING_STRAIGHT_TIME + HOMING_CHASE_TIME };
@@ -3226,6 +3541,7 @@ function broadcastState(now) {
             healthOrbs: healthOrbs.map(o => ({ id: o.id, x: o.x, y: o.y, r: HEALORB_RADIUS, targetId: o.targetId })),
             shrapnel: shrapnel.map(s => ({ x: s.x, y: s.y, angle: s.angle, cx: s.cx, cy: s.cy, explosionId: s.explosionId })),
             cleanEvents: cleanEvents.map(e => ({ id: e.id, x: e.x, y: e.y, spawnTime: e.spawnTime, kind: e.kind || "clean" })),
+            nukes: nukes.map(n => ({ id: n.id, col: n.col, row: n.row, placedAt: n.placedAt, explodeAt: n.explodeAt, exploded: n.exploded })),
             airstrikes: airstrikes.map(s => ({ id: s.id, col: s.col, row: s.row, cx: s.cx, cy: s.cy, confirmTime: s.confirmTime })),
             bounceLasers: bounceLasers.map(bl => ({ id: bl.id, ownerId: bl.ownerId, points: bl.points })),
             blackHoles: blackHoles.map(bh => ({ id: bh.id, col: bh.col, row: bh.row, triggerTime: bh.triggerTime })),
