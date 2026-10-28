@@ -288,11 +288,60 @@ function startDebugMode(){
   s.onerror=()=>{ statusEl.textContent='No server, and server.js not found next to game.html'; };
   document.head.appendChild(s);
 }
+// The server only sends what changed since the last tick (first message = full snapshot).
+// Merge it into a fresh copy of the previous state so the rest of the code sees a complete state.
+function mergeState(m){
+  const patch=m.state;
+  if(m.full) return patch;
+  const next=Object.assign({},state,patch);
+  if(patch.players){
+    const np={};
+    for(const id in patch.players) np[id]=Object.assign({},state.players[id]||{},patch.players[id]);
+    next.players=np;
+  }
+  return next;
+}
+// ---- smooth rendering ----
+// Server updates arrive ~30x/s but unevenly. Instead of drawing the newest position directly, draw the world
+// INTERP_DELAY ms in the past, gliding between the two updates around that moment (tanks + bullets).
+const INTERP_DELAY=70, snaps=[];
+function pushSnap(s){
+  const t=performance.now(), pl={}, bl={};
+  for(const id in s.players){ const p=s.players[id]; pl[id]={x:p.x,y:p.y,a:p.a}; }
+  for(const b of (s.bullets||[])) if(b.id!=null) bl[b.id]={x:b.x,y:b.y,a:b.a};
+  const last=snaps[snaps.length-1];
+  if(last && t-last.t>100) snaps.push({t:t-33,pl:last.pl,bl:last.bl}); // server was quiet (nothing moved): hold still, then start moving
+  snaps.push({t,pl,bl});
+  while(snaps.length>12) snaps.shift();
+}
+function angDiff(d){ return ((d+Math.PI)%(Math.PI*2)+Math.PI*2)%(Math.PI*2)-Math.PI; }
+function interpState(cur){
+  const rt=performance.now()-INTERP_DELAY;
+  let j=-1; for(let i=0;i<snaps.length;i++) if(snaps[i].t<=rt) j=i;
+  if(j<0 || j>=snaps.length-1) return cur; // nothing newer to blend toward
+  const A=snaps[j], B=snaps[j+1], f=Math.max(0,Math.min(1,(rt-A.t)/(B.t-A.t)));
+  const lerpXYA=(o,a,b)=>{
+    if(Math.hypot(b.x-a.x,b.y-a.y)>80) return o; // teleport / swap: don't glide across the map
+    return Object.assign({},o,{x:a.x+(b.x-a.x)*f, y:a.y+(b.y-a.y)*f, a:a.a+angDiff(b.a-a.a)*f});
+  };
+  const out=Object.assign({},cur), players={};
+  for(const id in cur.players){ const a=A.pl[id], b=B.pl[id]; players[id]=(a&&b)?lerpXYA(cur.players[id],a,b):cur.players[id]; }
+  out.players=players;
+  out.bullets=[];
+  for(const bu of (cur.bullets||[])){
+    if(bu.id==null){ out.bullets.push(bu); continue; }
+    const a=A.bl[bu.id], b=B.bl[bu.id];
+    if(!a) continue; // spawned after the moment we are drawing: not visible yet (otherwise it pops in ~15px ahead, then snaps back)
+    out.bullets.push(b?lerpXYA(bu,a,b):bu);
+  }
+  return out;
+}
 function handleMessage(e){
     const m=JSON.parse(e.data);
     if(m.type==='welcome') myId=m.id;
     if(m.type==='full') statusEl.textContent='Server full (max 4 players)';
     if(m.type==='state'){
+      m.state=mergeState(m);
       const newPlayers=m.state.players;
       for(const [id,np] of Object.entries(newPlayers)){
         if(prevAlive[id]===true && np.alive===false){
@@ -306,7 +355,7 @@ function handleMessage(e){
       for(const b of (m.state.bullets||[])){
         if(b.type!=='normal'||b.id==null) continue;
         newBulletIds.add(b.id);
-        if(!prevBulletIds.has(b.id)) muzzleSmokes.push(makeMuzzleSmoke(b.x,b.y,b.a));
+        if(!prevBulletIds.has(b.id)){ const bx=b.x,by=b.y,ba=b.a; setTimeout(()=>muzzleSmokes.push(makeMuzzleSmoke(bx,by,ba)),INTERP_DELAY); } // in step with the delayed bullet
       }
       prevBulletIds=newBulletIds;
 
@@ -339,6 +388,7 @@ function handleMessage(e){
       }
 
       state=m.state;
+      pushSnap(state);
       if(chatOpen && !chatMode()) closeChat(); // died / game over while typing
       renderLobbyChat();
       applyGridSize(m.state.cols,m.state.rows,m.state.scale);
@@ -409,10 +459,16 @@ function controls(){
     shoot: !!keys.Space
   };
 }
-let last=0;
+let last=0, lastInputJson='', lastInputAt=0;
 function frame(t){
-  if(t-last>33){ send({type:'input',input:controls()}); last=t; }
-  render();
+  if(t-last>33){
+    // only send when the controls changed (plus a keep-alive every 4s) - the server remembers held keys
+    const inp=JSON.stringify({type:'input',input:controls()});
+    if((inp!==lastInputJson || t-lastInputAt>4000) && ws && ws.readyState===1){ ws.send(inp); lastInputJson=inp; lastInputAt=t; }
+    last=t;
+  }
+  const real=state;
+  try{ state=interpState(real); render(); } finally{ state=real; }
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);

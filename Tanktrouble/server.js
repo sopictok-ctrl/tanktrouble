@@ -15,22 +15,49 @@ const MIME_TYPES = { ".html": "text/html", ".js": "application/javascript", ".pn
 // ---------- static file server ----------
 let server = null, wss = null;
 if (IS_NODE) {
-server = http.createServer((req, res) => {
-    let filePath = req.url === "/"
-        ? path.join(__dirname, "game.html")
-        : path.join(__dirname, req.url);
-
-    fs.readFile(filePath, (err, data) => {
-        if (err) {
-            res.writeHead(404);
-            res.end("Not found");
-            return;
-        }
-        const ext = path.extname(filePath).toLowerCase();
-        const contentType = MIME_TYPES[ext] || "text/html";
-        res.writeHead(200, { "Content-Type": contentType });
-        res.end(data);
+const zlib = require("zlib");
+const crypto = require("crypto");
+const staticCache = new Map(); // filePath -> { mtime, data, gz, etag, type }
+function serveStatic(req, res, filePath) {
+    fs.stat(filePath, (err, st) => {
+        if (err || !st.isFile()) { res.writeHead(404); res.end("Not found"); return; }
+        const send = (e) => {
+            const ext = path.extname(filePath).toLowerCase();
+            const headers = {
+                "Content-Type": e.type, "ETag": e.etag, "Vary": "Accept-Encoding",
+                // html/js: always revalidate (cheap 304); images: cache for a day
+                "Cache-Control": (ext === ".html" || ext === ".js") ? "no-cache" : "public, max-age=86400"
+            };
+            if (req.headers["if-none-match"] === e.etag) { res.writeHead(304, headers); res.end(); return; }
+            if (e.gz && /\bgzip\b/.test(req.headers["accept-encoding"] || "")) {
+                headers["Content-Encoding"] = "gzip";
+                res.writeHead(200, headers); res.end(e.gz);
+            } else { res.writeHead(200, headers); res.end(e.data); }
+        };
+        const cached = staticCache.get(filePath);
+        if (cached && cached.mtime === st.mtimeMs) return send(cached);
+        fs.readFile(filePath, (er, data) => {
+            if (er) { res.writeHead(404); res.end("Not found"); return; }
+            const ext = path.extname(filePath).toLowerCase();
+            const e = {
+                mtime: st.mtimeMs, data,
+                gz: (ext === ".html" || ext === ".js" || ext === ".svg") ? zlib.gzipSync(data, { level: 9 }) : null,
+                etag: '"' + crypto.createHash("md5").update(data).digest("hex") + '"',
+                type: MIME_TYPES[ext] || "text/html"
+            };
+            staticCache.set(filePath, e);
+            send(e);
+        });
     });
+}
+server = http.createServer((req, res) => {
+    let urlPath;
+    try { urlPath = decodeURIComponent((req.url || "/").split("?")[0]); }
+    catch (e) { res.writeHead(400); res.end("Bad request"); return; }
+    if (urlPath === "/healthz") { res.writeHead(200, { "Content-Type": "text/plain" }); res.end("ok"); return; } // tiny endpoint for uptime pings
+    const filePath = path.resolve(__dirname, "." + (urlPath === "/" ? "/game.html" : urlPath));
+    if (!filePath.startsWith(__dirname + path.sep)) { res.writeHead(403); res.end("Forbidden"); return; } // no ../ escapes
+    serveStatic(req, res, filePath);
 });
 
 wss = new WebSocket.Server({ server });
@@ -1227,6 +1254,7 @@ function handleConnection(ws) {
         return;
     }
 
+    ws.needsFull = true; // first state message to this client is a full snapshot, later ones are deltas
     const id = nextPlayerId++;
     const spawnPool = landCells();
     const spawn = spawnPool[Math.floor(Math.random() * spawnPool.length)];
@@ -3403,7 +3431,22 @@ function tickInner() {
     broadcastState(now);
 }
 
+// ---- network helpers ----
+// Positions are rounded for the wire (0.1px / 0.001rad is invisible on screen but saves ~60% of the digits).
+const r1 = (v) => Math.round(v * 10) / 10;
+const r3 = (v) => Math.round(v * 1000) / 1000;
+// Delta bookkeeping: what the clients already have. Every state message after a client's first one only
+// carries what changed since the previous tick (top-level keys + per-player fields); nothing changed => nothing sent.
+let prevKeyJson = {}, prevPlayersOut = {}, prevPlayerIds = "", lastSentAt = 0;
+function sameVal(a, b) {
+    if (a === b) return true;
+    if (a && b && typeof a === "object" && typeof b === "object") return JSON.stringify(a) === JSON.stringify(b);
+    return false;
+}
+
 function broadcastState(now) {
+    const clients = IS_NODE ? Array.from(wss.clients).filter(c => c.readyState === WebSocket.OPEN) : Array.from(debugSockets);
+    if (clients.length === 0) { prevKeyJson = {}; prevPlayersOut = {}; prevPlayerIds = ""; return; } // nobody listening: do no work
     const hostId = currentHostId();
     const outPlayers = {};
     for (const id in players) {
@@ -3461,7 +3504,7 @@ function broadcastState(now) {
         outPlayers[id] = {
             safeBlocked,
             waterLeft: p.waterSince != null ? Math.max(0, (WATER_GRACE_MS - (now - p.waterSince)) / 1000) : null,
-            id: p.id, x: p.x, y: p.y, a: p.a, color: p.color, name: p.name || "",
+            id: p.id, x: r1(p.x), y: r1(p.y), a: r3(p.a), color: p.color, name: p.name || "",
             alive: p.alive, score: p.score || 0, ready: p.ready,
             glow, charging: p.laserCharging, powerup: p.powerup,
             powerBeamShots: p.powerBeamShots || 0,
@@ -3470,7 +3513,7 @@ function broadcastState(now) {
             superBulletShots: p.superBulletShots || 0,
             timeShieldAmmo: p.timeShieldAmmo || 0, timeShieldActive: !!p.timeShieldActive,
             fastBulletShots: p.fastBulletShots || 0,
-            droneActive: !!p.droneActive, droneX: p.droneX, droneY: p.droneY, droneShots: p.droneShots || 0,
+            droneActive: !!p.droneActive, droneX: r1(p.droneX), droneY: r1(p.droneY), droneShots: p.droneShots || 0,
             blackHoleShots: p.blackHoleShots || 0,
             wallShots: p.wallShots || 0,
             waterShots: p.waterShots || 0,
@@ -3497,17 +3540,17 @@ function broadcastState(now) {
             cloneFadeFrac: p.isClone ? Math.max(0, Math.min(1, (p.cloneSpawnedAt - now) / CLONE_SPAWN_TIME)) : 0,
             shockLine: p.powerup === "shock" ? computeShockTiles(p) : null,
             teleportTargeting: p.teleportTargeting,
-            teleportCursorX: p.teleportCursorX,
-            teleportCursorY: p.teleportCursorY,
+            teleportCursorX: r1(p.teleportCursorX),
+            teleportCursorY: r1(p.teleportCursorY),
             airstrikeTargeting: p.airstrikeTargeting,
-            airstrikeCursorX: p.airstrikeCursorX,
-            airstrikeCursorY: p.airstrikeCursorY,
+            airstrikeCursorX: r1(p.airstrikeCursorX),
+            airstrikeCursorY: r1(p.airstrikeCursorY),
             hackTargeting: p.hackTargeting,
-            hackCursorX: p.hackCursorX,
-            hackCursorY: p.hackCursorY,
+            hackCursorX: r1(p.hackCursorX),
+            hackCursorY: r1(p.hackCursorY),
             swapTargeting: p.swapTargeting,
-            swapCursorX: p.swapCursorX,
-            swapCursorY: p.swapCursorY,
+            swapCursorX: r1(p.swapCursorX),
+            swapCursorY: r1(p.swapCursorY),
             hacking: p.hackingTargetId != null,
             hackSecondsLeft: p.hackingTargetId != null ? Math.max(0, Math.ceil((p.hackEndsAt - now) / 1000)) : 0,
             hacked: p.hackedById != null,
@@ -3516,6 +3559,8 @@ function broadcastState(now) {
                 : (p.up || p.down || p.left || p.right)),
             piloting: !!p.rcRocketId
         };
+        const op = outPlayers[id]; // JSON drops undefined, which would break delta merging - make it null
+        for (const k in op) if (op[k] === undefined) op[k] = null;
     }
 
     let lonelyInfo = null;
@@ -3526,29 +3571,27 @@ function broadcastState(now) {
         }
     }
 
-    const message = JSON.stringify({
-        type: "state",
-        state: {
+    const fullState = {
             gamePhase, roundNumber, paused, hostId,
             lobbyChat: gamePhase === "lobby" ? lobbyChat : [],
             players: outPlayers,
             bullets: bullets.map(b => {
-                if (b.type === "homing") return { x: b.x, y: b.y, a: Math.atan2(b.vy, b.vx), type: "homing", color: b.color, spawnTime: b.spawnTime, maxLife: HOMING_STRAIGHT_TIME + HOMING_CHASE_TIME };
-                if (b.type === "rc") return { x: b.x, y: b.y, a: b.a, type: "rc", spawnTime: b.spawnTime, maxLife: RC_MAX_LIFETIME };
-                if (b.type === "abomb") return { x: b.x, y: b.y, type: "abomb", spawnTime: b.spawnTime, fuseTime: ABOMB_FUSE_TIME };
-                return { id: b.id, x: b.x, y: b.y, a: Math.atan2(b.vy, b.vx), type: b.type, bounces: b.bounces, maxBounces: b.maxBounces || MAX_BOUNCES };
+                if (b.type === "homing") return { x: r1(b.x), y: r1(b.y), a: r3(Math.atan2(b.vy, b.vx)), type: "homing", color: b.color, spawnTime: b.spawnTime, maxLife: HOMING_STRAIGHT_TIME + HOMING_CHASE_TIME };
+                if (b.type === "rc") return { x: r1(b.x), y: r1(b.y), a: r3(b.a), type: "rc", spawnTime: b.spawnTime, maxLife: RC_MAX_LIFETIME };
+                if (b.type === "abomb") return { x: r1(b.x), y: r1(b.y), type: "abomb", spawnTime: b.spawnTime, fuseTime: ABOMB_FUSE_TIME };
+                return { id: b.id, x: r1(b.x), y: r1(b.y), a: r3(Math.atan2(b.vy, b.vx)), type: b.type, bounces: b.bounces, maxBounces: b.maxBounces || MAX_BOUNCES };
             }),
-            healthOrbs: healthOrbs.map(o => ({ id: o.id, x: o.x, y: o.y, r: HEALORB_RADIUS, targetId: o.targetId })),
-            shrapnel: shrapnel.map(s => ({ x: s.x, y: s.y, angle: s.angle, cx: s.cx, cy: s.cy, explosionId: s.explosionId })),
+            healthOrbs: healthOrbs.map(o => ({ id: o.id, x: r1(o.x), y: r1(o.y), r: HEALORB_RADIUS, targetId: o.targetId })),
+            shrapnel: shrapnel.map(s => ({ x: r1(s.x), y: r1(s.y), angle: r3(s.angle), cx: r1(s.cx), cy: r1(s.cy), explosionId: s.explosionId })),
             cleanEvents: cleanEvents.map(e => ({ id: e.id, x: e.x, y: e.y, spawnTime: e.spawnTime, kind: e.kind || "clean" })),
             nukes: nukes.map(n => ({ id: n.id, col: n.col, row: n.row, placedAt: n.placedAt, explodeAt: n.explodeAt, exploded: n.exploded })),
             airstrikes: airstrikes.map(s => ({ id: s.id, col: s.col, row: s.row, cx: s.cx, cy: s.cy, confirmTime: s.confirmTime })),
-            bounceLasers: bounceLasers.map(bl => ({ id: bl.id, ownerId: bl.ownerId, points: bl.points })),
+            bounceLasers: bounceLasers.map(bl => ({ id: bl.id, ownerId: bl.ownerId, points: bl.points.map(q => ({ x: r1(q.x), y: r1(q.y) })) })),
             blackHoles: blackHoles.map(bh => ({ id: bh.id, col: bh.col, row: bh.row, triggerTime: bh.triggerTime })),
             shocks: shocks.map(sh => ({ id: sh.id, tiles: sh.tiles, litUpTo: Math.min(Math.floor((now - sh.startTime) / SHOCK_STEP_TIME), sh.tiles.length - 1) })),
             darkness: now < darknessUntil ? { ownerId: darknessOwnerId } : null,
             simOffset: simTimeOffset,
-            tickMs: Math.round(tickMsAvg * 10) / 10,
+            tickMs: tickMsShown,
             timeStop: Date.now() < timeStopUntil ? { ownerId: timeStopOwnerId, secondsLeft: Math.max(0, (timeStopUntil - Date.now()) / 1000) } : null,
             safeTiles: safeTiles.map(st => ({ id: st.id, col: st.col, row: st.row })),
             jokerChoices: JOKER_CHOICES,
@@ -3566,15 +3609,43 @@ function broadcastState(now) {
             gameWinner: gamePhase === "gameover" ? gameWinner : null,
             winScore: WIN_SCORE,
             colors: COLORS
-        }
-    });
+    };
 
-    if (IS_NODE) {
-        wss.clients.forEach((client) => {
-            if (client.readyState === WebSocket.OPEN) client.send(message);
-        });
-    } else {
-        for (const c of debugSockets) c.send(message);
+    // ---- delta encoding ----
+    const patchParts = [];
+    for (const k in fullState) {
+        if (k === "players") continue;
+        const js = JSON.stringify(fullState[k]) ?? "null";
+        if (js !== prevKeyJson[k]) { prevKeyJson[k] = js; patchParts.push(JSON.stringify(k) + ":" + js); }
+    }
+    const idList = Object.keys(outPlayers).join(",");
+    const dPlayers = {};
+    let playersChanged = idList !== prevPlayerIds;
+    for (const id in outPlayers) {
+        const o = outPlayers[id], pv = prevPlayersOut[id];
+        if (!pv) { dPlayers[id] = o; playersChanged = true; continue; }
+        let d = null;
+        for (const k in o) if (!sameVal(o[k], pv[k])) (d || (d = {}))[k] = o[k];
+        if (d) playersChanged = true;
+        dPlayers[id] = d || {};
+    }
+    prevPlayersOut = outPlayers; prevPlayerIds = idList;
+    if (playersChanged) patchParts.push('"players":' + JSON.stringify(dPlayers));
+
+    const patchMsg = patchParts.length ? '{"type":"state","state":{' + patchParts.join(",") + '}}' : null;
+    let fullMsg = null;
+    for (const c of clients) {
+        if (c.needsFull) { // brand-new client: complete snapshot (includes this tick's changes)
+            if (!fullMsg) fullMsg = JSON.stringify({ type: "state", full: true, state: fullState });
+            c.needsFull = false;
+            c.send(fullMsg);
+        } else if (patchMsg) c.send(patchMsg);
+    }
+    const wall = Date.now();
+    if (patchMsg || fullMsg) lastSentAt = wall;
+    else if (wall - lastSentAt > 5000) { // tiny keep-alive so proxies don't drop an otherwise silent connection
+        for (const c of clients) c.send('{"type":"hb"}');
+        lastSentAt = wall;
     }
 }
 
@@ -3582,7 +3653,7 @@ function broadcastState(now) {
 // Measures how long each server tick takes (simulation + broadcast). The
 // smoothed value is sent to clients (shown top-right), and every 10s the
 // average + worst tick is printed to the console.
-let tickMsAvg = 0, tickMsMax = 0, tickLogAt = Date.now() + 10000;
+let tickMsAvg = 0, tickMsMax = 0, tickLogAt = Date.now() + 10000, tickMsShown = 0, tickMsShownAt = 0;
 function perfNow() { return IS_NODE ? Number(process.hrtime.bigint()) / 1e6 : performance.now(); }
 function tick() {
     const t0 = perfNow();
@@ -3590,6 +3661,7 @@ function tick() {
     const ms = perfNow() - t0;
     tickMsAvg = tickMsAvg === 0 ? ms : tickMsAvg * 0.9 + ms * 0.1;
     if (ms > tickMsMax) tickMsMax = ms;
+    if (Date.now() - tickMsShownAt >= 1000) { tickMsShown = Math.round(tickMsAvg * 10) / 10; tickMsShownAt = Date.now(); }
     if (Date.now() >= tickLogAt) {
         console.log("[perf] tick avg " + tickMsAvg.toFixed(2) + " ms, max " + tickMsMax.toFixed(2) + " ms (last 10s)");
         tickMsMax = 0;
